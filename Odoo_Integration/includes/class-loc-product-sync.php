@@ -53,15 +53,24 @@ class LOC_Product_Sync {
         }
 
         $domain = [ [ 'active', '=', true ], [ 'sale_ok', '=', true ] ];
-        $batch  = (int) apply_filters( 'loc_odoo_product_pull_batch_size', 200 );
+        // Ask up to this many rows per request; Odoo often caps lower (~80). Do NOT stop when count < limit — that was skipping all following pages.
+        $batch = (int) apply_filters( 'loc_odoo_product_pull_batch_size', 80 );
         if ( $batch < 1 ) {
-            $batch = 200;
+            $batch = 80;
         }
 
-        $offset = 0;
-        $total  = 0;
+        $max_pages = (int) apply_filters( 'loc_odoo_product_pull_max_pages', 500 );
+        if ( $max_pages < 1 ) {
+            $max_pages = 500;
+        }
 
-        while ( true ) {
+        $offset   = 0;
+        $total    = 0;
+        $page     = 0;
+        $fetched  = 0;
+
+        while ( $page < $max_pages ) {
+            ++$page;
             $records = LOC_API::search_read(
                 'product.template',
                 $domain,
@@ -101,14 +110,16 @@ class LOC_Product_Sync {
                 ++$total;
             }
 
-            if ( count( $records ) < $batch ) {
-                break;
-            }
-
-            $offset += $batch;
+            $fetched  = count( $records );
+            $offset  += $fetched;
         }
 
-        LOC_API::log( 'product_pull', 0, 0, 'ok', "Pull finished: {$total} Odoo product template(s) processed." );
+        $suffix = '';
+        if ( $page >= $max_pages && $fetched >= $batch ) {
+            $suffix = " — stopped at page cap ({$max_pages}); more products may exist in Odoo (raise loc_odoo_product_pull_max_pages).";
+        }
+
+        LOC_API::log( 'product_pull', 0, 0, 'ok', "Pull finished: {$total} Odoo product template(s) processed.{$suffix}" );
     }
 
     /**
