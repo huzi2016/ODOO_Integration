@@ -67,23 +67,13 @@ class LOC_Inventory_Sync {
             }
         }
 
-        // Fetch qty_available for all those products in one call
+        // Stock is on product.product (variants); sum per product.template id (Odoo 17+ has no qty_available on template).
         $odoo_ids = array_keys( $odoo_to_wc );
-        $records  = LOC_API::read(
-            'product.template',
-            $odoo_ids,
-            [ 'id', 'qty_available', 'virtual_available' ]
-        );
+        $qty_map  = LOC_API::sum_qty_available_by_template_ids( $odoo_ids );
 
-        if ( ! is_array( $records ) ) {
-            LOC_API::log( 'inventory_pull', 0, 0, 'error', 'read() failed' );
-            return;
-        }
-
-        foreach ( $records as $rec ) {
-            $odoo_id  = (int) $rec['id'];
-            $qty      = (float) $rec['qty_available'];
-            $wc_id    = $odoo_to_wc[ $odoo_id ] ?? 0;
+        foreach ( $odoo_ids as $odoo_id ) {
+            $qty   = (float) ( $qty_map[ $odoo_id ] ?? 0.0 );
+            $wc_id = $odoo_to_wc[ $odoo_id ] ?? 0;
 
             if ( ! $wc_id ) {
                 continue;

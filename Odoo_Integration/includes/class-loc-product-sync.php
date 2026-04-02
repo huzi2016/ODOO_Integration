@@ -19,8 +19,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class LOC_Product_Sync {
 
-    // Odoo fields we care about
-    const ODOO_FIELDS = [ 'id', 'name', 'description_sale', 'list_price', 'qty_available', 'active', 'default_code' ];
+    // Odoo product.template fields (no qty_available: invalid on template in Odoo 17+ / 19 — use variants via LOC_API::sum_qty_available_by_template_ids).
+    const ODOO_FIELDS = [ 'id', 'name', 'description_sale', 'list_price', 'active', 'default_code' ];
 
     public static function init(): void {
         // ── Scheduled pull (Odoo → WP) ──────────────────────────────────────
@@ -83,10 +83,20 @@ class LOC_Product_Sync {
                 break;
             }
 
+            $batch_tmpl_ids = [];
+            foreach ( $records as $rec ) {
+                if ( is_array( $rec ) && isset( $rec['id'] ) ) {
+                    $batch_tmpl_ids[] = (int) $rec['id'];
+                }
+            }
+            $qty_by_tmpl = LOC_API::sum_qty_available_by_template_ids( $batch_tmpl_ids );
+
             foreach ( $records as $rec ) {
                 if ( ! is_array( $rec ) || ! isset( $rec['id'] ) ) {
                     continue;
                 }
+                $tid = (int) $rec['id'];
+                $rec['qty_available'] = $qty_by_tmpl[ $tid ] ?? 0.0;
                 self::upsert_wc_product( $rec );
                 ++$total;
             }

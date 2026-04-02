@@ -153,6 +153,74 @@ class LOC_API {
         return self::json2_request( $model, $method, $body );
     }
 
+    /**
+     * Sum qty_available on product.product variants per product.template id.
+     *
+     * Odoo 17+ / 19+ often reject qty_available on product.template (HTTP 500 / invalid field).
+     * Stock lives on variants; multi-variant templates get summed qty.
+     *
+     * @param int[] $template_ids product.template database ids.
+     * @return array<int,float> template_id => total qty_available
+     */
+    public static function sum_qty_available_by_template_ids( array $template_ids ): array {
+        $ids = [];
+        foreach ( $template_ids as $id ) {
+            $i = (int) $id;
+            if ( $i > 0 ) {
+                $ids[] = $i;
+            }
+        }
+        $ids = array_values( array_unique( $ids, SORT_NUMERIC ) );
+        if ( $ids === [] ) {
+            return [];
+        }
+
+        /** @var array<int,float> $sums */
+        $sums = array_fill_keys( $ids, 0.0 );
+
+        $chunk = (int) apply_filters( 'loc_odoo_variant_stock_chunk', 80 );
+        if ( $chunk < 1 ) {
+            $chunk = 80;
+        }
+
+        for ( $i = 0, $n = count( $ids ); $i < $n; $i += $chunk ) {
+            $slice = array_slice( $ids, $i, $chunk );
+            $variants = self::search_read(
+                'product.product',
+                [ [ 'product_tmpl_id', 'in', $slice ] ],
+                [ 'product_tmpl_id', 'qty_available' ],
+                [ 'limit' => 10000 ]
+            );
+            if ( ! is_array( $variants ) ) {
+                continue;
+            }
+            foreach ( $variants as $v ) {
+                if ( ! is_array( $v ) ) {
+                    continue;
+                }
+                $tid = self::many2one_to_int( $v['product_tmpl_id'] ?? null );
+                if ( $tid > 0 && array_key_exists( $tid, $sums ) ) {
+                    $sums[ $tid ] += (float) ( $v['qty_available'] ?? 0 );
+                }
+            }
+        }
+
+        return $sums;
+    }
+
+    /**
+     * @param mixed $val Many2one value: id or [ id, display_name ].
+     */
+    private static function many2one_to_int( mixed $val ): int {
+        if ( is_int( $val ) || is_float( $val ) ) {
+            return (int) $val;
+        }
+        if ( is_array( $val ) && array_key_exists( 0, $val ) && is_numeric( $val[0] ) ) {
+            return (int) $val[0];
+        }
+        return 0;
+    }
+
     // ── JSON-2 transport (Odoo 19+) ──────────────────────────────────────────
 
     private static function json2_request( string $model, string $method, array $body ): mixed {
