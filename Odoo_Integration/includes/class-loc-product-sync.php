@@ -43,23 +43,62 @@ class LOC_Product_Sync {
 
     /**
      * Pull all active products from Odoo and upsert into WooCommerce.
+     *
+     * Uses offset pagination: many Odoo instances cap how many rows one search_read returns
+     * (often 80), so a single large limit is not enough. Filter: loc_odoo_product_pull_batch_size.
      */
     public static function pull_all(): void {
-        $records = LOC_API::search_read(
-            'product.template',
-            [ [ 'active', '=', true ], [ 'sale_ok', '=', true ] ],
-            self::ODOO_FIELDS,
-            [ 'limit' => 500 ]
-        );
-
-        if ( ! is_array( $records ) ) {
-            LOC_API::log( 'product_pull', 0, 0, 'error', 'search_read failed' );
-            return;
+        if ( function_exists( 'set_time_limit' ) ) {
+            @set_time_limit( 300 );
         }
 
-        foreach ( $records as $rec ) {
-            self::upsert_wc_product( $rec );
+        $domain = [ [ 'active', '=', true ], [ 'sale_ok', '=', true ] ];
+        $batch  = (int) apply_filters( 'loc_odoo_product_pull_batch_size', 200 );
+        if ( $batch < 1 ) {
+            $batch = 200;
         }
+
+        $offset = 0;
+        $total  = 0;
+
+        while ( true ) {
+            $records = LOC_API::search_read(
+                'product.template',
+                $domain,
+                self::ODOO_FIELDS,
+                [
+                    'limit'  => $batch,
+                    'offset' => $offset,
+                ]
+            );
+
+            if ( ! is_array( $records ) ) {
+                if ( $offset === 0 ) {
+                    LOC_API::log( 'product_pull', 0, 0, 'error', 'search_read failed or unexpected response shape' );
+                }
+                break;
+            }
+
+            if ( $records === [] ) {
+                break;
+            }
+
+            foreach ( $records as $rec ) {
+                if ( ! is_array( $rec ) || ! isset( $rec['id'] ) ) {
+                    continue;
+                }
+                self::upsert_wc_product( $rec );
+                ++$total;
+            }
+
+            if ( count( $records ) < $batch ) {
+                break;
+            }
+
+            $offset += $batch;
+        }
+
+        LOC_API::log( 'product_pull', 0, 0, 'ok', "Pull finished: {$total} Odoo product template(s) processed." );
     }
 
     /**
@@ -104,9 +143,14 @@ class LOC_Product_Sync {
         // Suppress re-push to Odoo while saving this product
         remove_action( 'woocommerce_update_product', [ __CLASS__, 'push_product' ], 20 );
 
-        $wc_id = $product->save();
-
-        add_action( 'woocommerce_update_product', [ __CLASS__, 'push_product' ], 20 );
+        $wc_id = 0;
+        try {
+            $wc_id = $product->save();
+        } catch ( \Throwable $e ) {
+            LOC_API::log( 'product_pull', 0, $odoo_id, 'error', 'WC save failed: ' . $e->getMessage() );
+        } finally {
+            add_action( 'woocommerce_update_product', [ __CLASS__, 'push_product' ], 20 );
+        }
 
         if ( $wc_id ) {
             update_post_meta( $wc_id, '_loc_odoo_product_id',      $odoo_id );

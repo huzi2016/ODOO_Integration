@@ -2,7 +2,7 @@
 /**
  * Plugin Name: LIMO Odoo Connector
  * Description: Integrates LIMO_Membership / WooCommerce with Odoo: default JSON-2 API (Odoo 19+), optional JSON-RPC for self-hosted 14–18. Product & inventory sync, orders, webhooks.
- * Version: 1.1.1
+ * Version: 1.1.2
  * Author: LIMO
  * Requires at least: 6.0
  * Requires PHP: 8.0
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'LOC_VERSION',     '1.1.1' );
+define( 'LOC_VERSION',     '1.1.2' );
 define( 'LOC_PLUGIN_PATH', plugin_dir_path( __FILE__ ) );
 define( 'LOC_PLUGIN_URL',  plugin_dir_url( __FILE__ ) );
 

@@ -108,11 +108,11 @@ class LOC_API {
         $kwargs['fields'] = $fields;
         if ( self::api_mode() === 'jsonrpc' ) {
             $r = self::legacy_execute( $model, 'search_read', [ $domain ], $kwargs );
-            return is_array( $r ) ? $r : false;
+            return self::normalize_search_read_rows( $r );
         }
         $kwargs['domain'] = $domain;
         $r                = self::json2_request( $model, 'search_read', $kwargs );
-        return is_array( $r ) ? $r : false;
+        return self::normalize_search_read_rows( $r );
     }
 
     public static function read( string $model, array $ids, array $fields = [] ): array|false {
@@ -261,6 +261,33 @@ class LOC_API {
         }
 
         return $parsed['result'] ?? false;
+    }
+
+    /**
+     * Odoo normally returns a list of dicts. JSON-2 may rarely return one dict; JSON must not be iterated as key/value rows.
+     *
+     * @param mixed $data Decoded JSON body.
+     * @return array<int,array<string,mixed>>|false
+     */
+    private static function normalize_search_read_rows( mixed $data ): array|false {
+        if ( $data === false || $data === null ) {
+            return false;
+        }
+        if ( ! is_array( $data ) ) {
+            return false;
+        }
+        if ( $data === [] ) {
+            return [];
+        }
+        $keys   = array_keys( $data );
+        $is_seq = $keys === range( 0, count( $data ) - 1 );
+        if ( $is_seq && isset( $data[0] ) && is_array( $data[0] ) && array_key_exists( 'id', $data[0] ) ) {
+            return $data;
+        }
+        if ( ! $is_seq && isset( $data['id'] ) && is_scalar( $data['id'] ) ) {
+            return [ $data ];
+        }
+        return false;
     }
 
     private static function normalize_create_result( mixed $r ): int|false {
