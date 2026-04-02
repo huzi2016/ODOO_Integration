@@ -1,15 +1,15 @@
 <?php
 /**
- * LOC_API — Odoo JSON-RPC client.
+ * LOC_API — Odoo HTTP API client.
  *
- * All HTTP calls go through here. Credentials are read from wp-config.php
- * constants or from the plugin settings page.
+ * Default: **JSON-2** (`POST /json/2/<model>/<method>`, `Authorization: bearer <api-key>`),
+ * required for typical Odoo 19+ setups where `/web/dataset/call_kw` rejects external POST (405).
  *
- * Required wp-config.php constants (or set via admin settings):
- *   LOC_ODOO_URL      e.g. https://mycompany.odoo.com
- *   LOC_ODOO_DB       e.g. mycompany
- *   LOC_ODOO_USER     e.g. admin@mycompany.com
- *   LOC_ODOO_PASSWORD e.g. secret
+ * Optional: **JSON-RPC** (`POST /jsonrpc`, `common` + `object.execute_kw`) for self-hosted
+ * Odoo 14–18. Choose in settings or set `LOC_ODOO_API_MODE` to `jsonrpc` in wp-config.php.
+ *
+ * Credentials: `LOC_ODOO_URL`, `LOC_ODOO_DB`, `LOC_ODOO_PASSWORD` (API key for JSON-2).
+ * JSON-RPC mode also needs `LOC_ODOO_USER` + password/API key.
  *
  * @package LIMO_Odoo_Connector
  */
@@ -20,12 +20,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class LOC_API {
 
-    // ── Singleton session state ──────────────────────────────────────────────
-
-    /** Odoo user-id returned by authenticate(). */
+    /** Cached uid from JSON-2 context_get or JSON-RPC authenticate. */
     private static ?int $uid = null;
-
-    // ── Config helpers ───────────────────────────────────────────────────────
 
     public static function url(): string {
         return defined( 'LOC_ODOO_URL' )
@@ -45,16 +41,26 @@ class LOC_API {
             : (string) get_option( 'loc_odoo_user', '' );
     }
 
+    /** API key (JSON-2) or password (JSON-RPC). */
     public static function password(): string {
         return defined( 'LOC_ODOO_PASSWORD' )
             ? LOC_ODOO_PASSWORD
             : (string) get_option( 'loc_odoo_password', '' );
     }
 
-    // ── Authentication ───────────────────────────────────────────────────────
+    /**
+     * `json2` (default) or `jsonrpc`.
+     */
+    public static function api_mode(): string {
+        if ( defined( 'LOC_ODOO_API_MODE' ) && in_array( LOC_ODOO_API_MODE, [ 'json2', 'jsonrpc' ], true ) ) {
+            return LOC_ODOO_API_MODE;
+        }
+        $m = (string) get_option( 'loc_odoo_api_mode', 'json2' );
+        return in_array( $m, [ 'json2', 'jsonrpc' ], true ) ? $m : 'json2';
+    }
 
     /**
-     * Authenticate and cache the Odoo uid for this request.
+     * Verify credentials; cache uid when possible.
      *
      * @return int|false Odoo user id or false on failure.
      */
@@ -63,131 +69,159 @@ class LOC_API {
             return self::$uid;
         }
 
-        $result = self::json_rpc(
-            self::url() . '/web/dataset/call_kw',
-            'common',
-            'authenticate',
-            [ self::db(), self::user(), self::password(), [] ]
-        );
+        if ( self::api_mode() === 'jsonrpc' ) {
+            $result = self::legacy_jsonrpc(
+                self::url() . '/jsonrpc',
+                'common',
+                'authenticate',
+                [ self::db(), self::user(), self::password(), [] ]
+            );
+            if ( is_int( $result ) && $result > 0 ) {
+                self::$uid = $result;
+                return self::$uid;
+            }
+            self::log( 'auth', 0, 0, 'error', 'JSON-RPC authenticate failed: ' . wp_json_encode( $result ) );
+            return false;
+        }
 
-        if ( is_int( $result ) && $result > 0 ) {
-            self::$uid = $result;
+        $ctx = self::json2_request( 'res.users', 'context_get', [] );
+        if ( is_array( $ctx ) && ! empty( $ctx['uid'] ) ) {
+            self::$uid = (int) $ctx['uid'];
             return self::$uid;
         }
 
-        self::log( 'auth', 0, 0, 'error', 'Authentication failed: ' . wp_json_encode( $result ) );
+        self::log( 'auth', 0, 0, 'error', 'JSON-2 context_get failed (check API key & database name).' );
         return false;
     }
 
-    // ── Public CRUD helpers ──────────────────────────────────────────────────
-
-    /**
-     * Search records and return their IDs.
-     *
-     * @param string $model   e.g. 'product.template'
-     * @param array  $domain  Odoo domain filter
-     * @param array  $kwargs  Extra keyword args (limit, offset, order…)
-     * @return int[]|false
-     */
     public static function search( string $model, array $domain = [], array $kwargs = [] ): array|false {
-        return self::execute( $model, 'search', [ $domain ], $kwargs );
+        if ( self::api_mode() === 'jsonrpc' ) {
+            $r = self::legacy_execute( $model, 'search', [ $domain ], $kwargs );
+            return is_array( $r ) ? $r : false;
+        }
+        $body = array_merge( [ 'domain' => $domain ], $kwargs );
+        $r    = self::json2_request( $model, 'search', $body );
+        return is_array( $r ) ? $r : false;
     }
 
-    /**
-     * Search and read records in one call.
-     *
-     * @param string   $model
-     * @param array    $domain
-     * @param string[] $fields
-     * @param array    $kwargs
-     * @return array[]|false
-     */
     public static function search_read( string $model, array $domain = [], array $fields = [], array $kwargs = [] ): array|false {
         $kwargs['fields'] = $fields;
-        return self::execute( $model, 'search_read', [ $domain ], $kwargs );
+        if ( self::api_mode() === 'jsonrpc' ) {
+            $r = self::legacy_execute( $model, 'search_read', [ $domain ], $kwargs );
+            return is_array( $r ) ? $r : false;
+        }
+        $kwargs['domain'] = $domain;
+        $r                = self::json2_request( $model, 'search_read', $kwargs );
+        return is_array( $r ) ? $r : false;
     }
 
-    /**
-     * Read specific record IDs.
-     *
-     * @param string   $model
-     * @param int[]    $ids
-     * @param string[] $fields
-     * @return array[]|false
-     */
     public static function read( string $model, array $ids, array $fields = [] ): array|false {
-        return self::execute( $model, 'read', [ $ids, $fields ] );
+        if ( self::api_mode() === 'jsonrpc' ) {
+            $r = self::legacy_execute( $model, 'read', [ $ids, $fields ], [] );
+            return is_array( $r ) ? $r : false;
+        }
+        $r = self::json2_request( $model, 'read', [ 'ids' => $ids, 'fields' => $fields ] );
+        return is_array( $r ) ? $r : false;
     }
 
-    /**
-     * Create a record and return the new id.
-     *
-     * @param string $model
-     * @param array  $vals
-     * @return int|false
-     */
     public static function create( string $model, array $vals ): int|false {
-        return self::execute( $model, 'create', [ $vals ] );
+        if ( self::api_mode() === 'jsonrpc' ) {
+            $r = self::legacy_execute( $model, 'create', [ $vals ], [] );
+            return self::normalize_create_result( $r );
+        }
+        $r = self::json2_request( $model, 'create', [ 'vals_list' => [ $vals ] ] );
+        return self::normalize_create_result( $r );
     }
 
-    /**
-     * Write (update) records.
-     *
-     * @param string $model
-     * @param int[]  $ids
-     * @param array  $vals
-     * @return bool|false
-     */
-    public static function write( string $model, array $ids, array $vals ): bool|false {
-        return self::execute( $model, 'write', [ $ids, $vals ] );
+    public static function write( string $model, array $ids, array $vals ): bool {
+        if ( self::api_mode() === 'jsonrpc' ) {
+            $r = self::legacy_execute( $model, 'write', [ $ids, $vals ], [] );
+            return $r === true;
+        }
+        $r = self::json2_request( $model, 'write', [ 'ids' => $ids, 'vals' => $vals ] );
+        return $r === true;
     }
 
-    /**
-     * Call an arbitrary method (e.g. action_confirm, action_invoice_sent…).
-     *
-     * @param string $model
-     * @param string $method
-     * @param array  $args
-     * @param array  $kwargs
-     * @return mixed
-     */
     public static function call( string $model, string $method, array $args = [], array $kwargs = [] ): mixed {
-        return self::execute( $model, $method, $args, $kwargs );
+        if ( self::api_mode() === 'jsonrpc' ) {
+            return self::legacy_execute( $model, $method, $args, $kwargs );
+        }
+        $body = $kwargs;
+        if ( $args !== [] && isset( $args[0] ) && is_array( $args[0] ) ) {
+            $body['ids'] = $args[0];
+        }
+        return self::json2_request( $model, $method, $body );
     }
 
-    // ── Low-level execute ────────────────────────────────────────────────────
+    // ── JSON-2 transport (Odoo 19+) ──────────────────────────────────────────
 
-    /**
-     * Call models/execute_kw on the Odoo object endpoint.
-     *
-     * @return mixed|false
-     */
-    public static function execute( string $model, string $method, array $args = [], array $kwargs = [] ): mixed {
+    private static function json2_request( string $model, string $method, array $body ): mixed {
+        $key = self::password();
+        if ( $key === '' ) {
+            self::log( 'json2', 0, 0, 'error', 'Missing API key (password field).' );
+            return false;
+        }
+
+        $base = self::url();
+        $url  = $base . '/json/2/' . rawurlencode( $model ) . '/' . rawurlencode( $method );
+
+        $headers = [
+            'Content-Type'  => 'application/json; charset=utf-8',
+            'Authorization' => 'bearer ' . $key,
+        ];
+        $db = self::db();
+        if ( $db !== '' ) {
+            $headers['X-Odoo-Database'] = $db;
+        }
+        $ua_ver = defined( 'LOC_VERSION' ) ? LOC_VERSION : '1.0.0';
+        $headers['User-Agent'] = 'LIMO-Odoo-Connector/' . $ua_ver . '; ' . home_url( '/' );
+
+        $response = wp_remote_post(
+            $url,
+            [
+                'headers'     => $headers,
+                'body'        => wp_json_encode( $body ),
+                'timeout'     => 60,
+                'data_format' => 'body',
+            ]
+        );
+
+        if ( is_wp_error( $response ) ) {
+            self::log( 'http', 0, 0, 'error', $response->get_error_message() );
+            return false;
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        $raw  = wp_remote_retrieve_body( $response );
+        $data = json_decode( $raw, true );
+
+        if ( $code < 200 || $code >= 300 ) {
+            $msg = is_array( $data ) && isset( $data['message'] )
+                ? (string) $data['message']
+                : $raw;
+            self::log( 'json2', 0, 0, 'error', 'HTTP ' . $code . ': ' . self::truncate( $msg, 500 ) );
+            return false;
+        }
+
+        return $data;
+    }
+
+    // ── Legacy JSON-RPC (/jsonrpc) ───────────────────────────────────────────
+
+    private static function legacy_execute( string $model, string $method, array $args = [], array $kwargs = [] ): mixed {
         $uid = self::authenticate();
         if ( $uid === false ) {
             return false;
         }
-
-        return self::json_rpc(
-            self::url() . '/web/dataset/call_kw',
+        return self::legacy_jsonrpc(
+            self::url() . '/jsonrpc',
             'object',
             'execute_kw',
             [ self::db(), $uid, self::password(), $model, $method, $args, $kwargs ]
         );
     }
 
-    // ── HTTP transport ───────────────────────────────────────────────────────
-
-    /**
-     * Send a JSON-RPC 2.0 request using wp_remote_post.
-     *
-     * @param string $url
-     * @param string $service  'common' | 'object'
-     * @param string $method
-     * @param array  $params
-     * @return mixed|false
-     */
-    private static function json_rpc( string $url, string $service, string $method, array $params ): mixed {
+    private static function legacy_jsonrpc( string $url, string $service, string $method, array $params ): mixed {
         $payload = wp_json_encode( [
             'jsonrpc' => '2.0',
             'method'  => 'call',
@@ -196,33 +230,48 @@ class LOC_API {
                 'method'  => $method,
                 'args'    => $params,
             ],
+            'id'      => 1,
         ] );
 
-        $response = wp_remote_post( $url, [
-            'headers'     => [ 'Content-Type' => 'application/json' ],
-            'body'        => $payload,
-            'timeout'     => 30,
-            'data_format' => 'body',
-        ] );
+        $ua_ver = defined( 'LOC_VERSION' ) ? LOC_VERSION : '1.0.0';
+        $response = wp_remote_post(
+            $url,
+            [
+                'headers'     => [
+                    'Content-Type' => 'application/json',
+                    'User-Agent'   => 'LIMO-Odoo-Connector/' . $ua_ver . '; ' . home_url( '/' ),
+                ],
+                'body'        => $payload,
+                'timeout'     => 60,
+                'data_format' => 'body',
+            ]
+        );
 
         if ( is_wp_error( $response ) ) {
             self::log( 'http', 0, 0, 'error', $response->get_error_message() );
             return false;
         }
 
-        $body   = wp_remote_retrieve_body( $response );
-        $parsed = json_decode( $body, true );
+        $parsed = json_decode( wp_remote_retrieve_body( $response ), true );
 
         if ( isset( $parsed['error'] ) ) {
             $msg = $parsed['error']['data']['message'] ?? wp_json_encode( $parsed['error'] );
-            self::log( 'rpc', 0, 0, 'error', $msg );
+            self::log( 'rpc', 0, 0, 'error', self::truncate( (string) $msg, 500 ) );
             return false;
         }
 
         return $parsed['result'] ?? false;
     }
 
-    // ── Internal log helper ──────────────────────────────────────────────────
+    private static function normalize_create_result( mixed $r ): int|false {
+        if ( is_int( $r ) && $r > 0 ) {
+            return $r;
+        }
+        if ( is_array( $r ) && isset( $r[0] ) && is_int( $r[0] ) ) {
+            return $r[0];
+        }
+        return false;
+    }
 
     public static function log( string $type, int $obj_id, int $odoo_id, string $status, string $msg = '' ): void {
         global $wpdb;
@@ -233,9 +282,16 @@ class LOC_API {
                 'object_id' => $obj_id,
                 'odoo_id'   => $odoo_id,
                 'status'    => $status,
-                'message'   => mb_substr( $msg, 0, 2000 ),
+                'message'   => self::truncate( $msg, 2000 ),
             ],
             [ '%s', '%d', '%d', '%s', '%s' ]
         );
+    }
+
+    private static function truncate( string $str, int $len ): string {
+        if ( function_exists( 'mb_substr' ) ) {
+            return mb_substr( $str, 0, $len );
+        }
+        return substr( $str, 0, $len );
     }
 }

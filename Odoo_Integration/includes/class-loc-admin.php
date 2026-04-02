@@ -41,6 +41,17 @@ class LOC_Admin {
         foreach ( $fields as $f ) {
             register_setting( 'loc_settings_group', $f, [ 'sanitize_callback' => 'sanitize_text_field' ] );
         }
+        register_setting(
+            'loc_settings_group',
+            'loc_odoo_api_mode',
+            [
+                'type'              => 'string',
+                'sanitize_callback' => static function ( $v ) {
+                    return in_array( $v, [ 'json2', 'jsonrpc' ], true ) ? $v : 'json2';
+                },
+                'default'           => 'json2',
+            ]
+        );
     }
 
     public static function enqueue( string $hook ): void {
@@ -77,10 +88,10 @@ class LOC_Admin {
         <?php settings_errors( 'loc_settings_group' ); ?>
 
         <nav class="nav-tab-wrapper">
-            <a href="#tab-settings" class="nav-tab nav-tab-active" id="loc-tab-settings">⚙️ 连接设置</a>
-            <a href="#tab-sync"     class="nav-tab"                id="loc-tab-sync">🔄 同步控制</a>
-            <a href="#tab-log"      class="nav-tab"                id="loc-tab-log">📋 同步日志</a>
-            <a href="#tab-guide"    class="nav-tab"                id="loc-tab-guide">📖 部署指南</a>
+            <a href="#tab-settings" class="nav-tab nav-tab-active" id="loc-tab-settings">⚙️ odoo connection</a>
+            <a href="#tab-sync"     class="nav-tab"                id="loc-tab-sync">🔄 sync control</a>
+            <a href="#tab-log"      class="nav-tab"                id="loc-tab-log">📋 sync log</a>
+            <a href="#tab-guide"    class="nav-tab"                id="loc-tab-guide">📖 deployment guide</a>
         </nav>
 
         <!-- ══ Tab: Settings ═══════════════════════════════════════════════ -->
@@ -94,80 +105,92 @@ class LOC_Admin {
                     <input class="regular-text" type="url" name="loc_odoo_url"
                            value="<?php echo esc_attr( get_option( 'loc_odoo_url' ) ); ?>"
                            placeholder="https://mycompany.odoo.com" />
-                    <p class="description">不含末尾斜线</p>
+                    <p class="description">without trailing slash</p>
                 </td>
             </tr>
             <tr>
-                <th>数据库名</th>
+                <th>Database name</th>
                 <td>
                     <input class="regular-text" type="text" name="loc_odoo_db"
                            value="<?php echo esc_attr( get_option( 'loc_odoo_db' ) ); ?>"
                            placeholder="mycompany" />
+                    <p class="description">Required for multi-database setup; leave empty for single database (determined by Host). JSON-2 is recommended to always fill in.</p>
                 </td>
             </tr>
             <tr>
-                <th>登录用户（邮箱）</th>
+                <th>API mode</th>
+                <td>
+                    <?php $api_mode = get_option( 'loc_odoo_api_mode', 'json2' ); ?>
+                    <label><input type="radio" name="loc_odoo_api_mode" value="json2" <?php checked( $api_mode, 'json2' ); ?> />
+                        <strong>JSON-2</strong> (recommended, Odoo 19+: <code>POST /json/2/…</code> + Bearer API key)</label><br>
+                    <label><input type="radio" name="loc_odoo_api_mode" value="jsonrpc" <?php checked( $api_mode, 'jsonrpc' ); ?> />
+                        <strong>JSON-RPC</strong> (self-hosted Odoo 14–18: <code>POST /jsonrpc</code>, login + password or API key)</label>
+                    <p class="description">If you see <code>405 Method Not Allowed</code>, use JSON-2 and paste an API key below.</p>
+                </td>
+            </tr>
+            <tr>
+                <th>Login user (email)</th>
                 <td>
                     <input class="regular-text" type="email" name="loc_odoo_user"
                            value="<?php echo esc_attr( get_option( 'loc_odoo_user' ) ); ?>" />
                 </td>
             </tr>
             <tr>
-                <th>密码 / API Key</th>
+                <th>Password / API Key</th>
                 <td>
                     <input class="regular-text" type="password" name="loc_odoo_password"
                            value="<?php echo esc_attr( get_option( 'loc_odoo_password' ) ); ?>" />
-                    <p class="description">建议使用 Odoo 后台生成的 API Key（Settings → Technical → API Keys）</p>
+                    <p class="description">In <strong>JSON-2 mode</strong>, use an <strong>API key</strong> here (not your login password): user menu → <strong>Preferences</strong> / <strong>My Profile</strong> → <strong>Account Security</strong> → New API Key. In <strong>JSON-RPC mode</strong>, you may use the account password or an API key.</p>
                 </td>
             </tr>
             <tr>
-                <th>Webhook 密钥</th>
+                <th>Webhook secret</th>
                 <td>
                     <input class="regular-text" type="text" name="loc_webhook_secret"
                            value="<?php echo esc_attr( get_option( 'loc_webhook_secret' ) ); ?>" />
-                    <p class="description">Odoo 回调请求头 <code>X-Odoo-Secret</code> 需填写此值</p>
+                    <p class="description">Odoo must send this value in the <code>X-Odoo-Secret</code> request header when calling your site.</p>
                 </td>
             </tr>
         </table>
-        <?php submit_button( '保存设置' ); ?>
+        <?php submit_button( 'Save settings' ); ?>
         </form>
 
         <hr>
-        <button id="loc-test-btn" class="button button-secondary">🧪 测试 Odoo 连接</button>
+        <button id="loc-test-btn" class="button button-secondary">🧪 Test Odoo connection</button>
         <span id="loc-test-result" style="margin-left:12px;font-weight:600;"></span>
         </div>
 
         <!-- ══ Tab: Sync Controls ══════════════════════════════════════════ -->
         <div id="tab-sync" class="loc-tab-content" style="display:none">
-        <h2>手动触发同步</h2>
+        <h2>Manually trigger sync</h2>
         <table class="wp-list-table widefat fixed striped" style="max-width:680px">
-            <thead><tr><th>同步任务</th><th>说明</th><th>操作</th></tr></thead>
+            <thead><tr><th>Sync task</th><th>Description</th><th>Action</th></tr></thead>
             <tbody>
                 <tr>
-                    <td><strong>商品拉取</strong></td>
-                    <td>从 Odoo 拉取商品信息 + 价格 → WooCommerce</td>
-                    <td><button class="button loc-sync-btn" data-action="loc_sync_products">立即同步</button></td>
+                    <td><strong>Product pull</strong></td>
+                    <td>Pull product information + price from Odoo → WooCommerce</td>
+                    <td><button class="button loc-sync-btn" data-action="loc_sync_products">Sync now</button></td>
                 </tr>
                 <tr>
-                    <td><strong>库存同步</strong></td>
-                    <td>从 Odoo 拉取实时库存 → WooCommerce</td>
-                    <td><button class="button loc-sync-btn" data-action="loc_sync_inventory">立即同步</button></td>
+                    <td><strong>Inventory sync</strong></td>
+                    <td>Pull real-time inventory from Odoo → WooCommerce</td>
+                    <td><button class="button loc-sync-btn" data-action="loc_sync_inventory">Sync now</button></td>
                 </tr>
             </tbody>
         </table>
         <p id="loc-sync-result" style="font-weight:600;color:#2271b1;margin-top:12px;"></p>
 
-        <h2 style="margin-top:32px;">Webhook 端点（配置到 Odoo）</h2>
+        <h2 style="margin-top:32px;">Webhook endpoints (configure to Odoo)</h2>
         <table class="form-table" style="max-width:680px">
-            <tr><th>发货完成回调</th><td><code id="loc-webhook-url"></code></td></tr>
-            <tr><th>库存变更推送</th><td><code id="loc-inv-url"></code></td></tr>
+            <tr><th>Delivery completed callback</th><td><code id="loc-webhook-url"></code></td></tr>
+            <tr><th>Inventory change push</th><td><code id="loc-inv-url"></code></td></tr>
         </table>
         </div>
 
         <!-- ══ Tab: Log ════════════════════════════════════════════════════ -->
         <div id="tab-log" class="loc-tab-content" style="display:none">
-        <h2>最近 100 条同步日志</h2>
-        <button id="loc-load-log" class="button">加载日志</button>
+        <h2>Last 100 sync logs</h2>
+        <button id="loc-load-log" class="button">Load logs</button>
         <div id="loc-log-container" style="margin-top:16px;"></div>
         </div>
 
@@ -198,25 +221,32 @@ class LOC_Admin {
     private static function render_guide(): void {
         ?>
         <div style="max-width:720px;line-height:1.8;">
-        <h2>部署步骤</h2>
+        <h2>Deployment steps</h2>
 
-        <h3>① 安装本插件</h3>
-        <p>将 <code>limo-odoo-connector/</code> 文件夹上传到 <code>wp-content/plugins/</code>，后台启用。</p>
+        <h3>① Install this plugin</h3>
+        <p>Upload the <code>limo-odoo-connector/</code> folder to <code>wp-content/plugins/</code>, and enable it in the backend.</p>
 
-        <h3>② 配置连接信息</h3>
-        <p>在「连接设置」页填写 Odoo URL、数据库名、登录账号和 API Key（推荐）。<br>
-        也可在 <code>wp-config.php</code> 中直接定义常量：</p>
+        <h3>② Configure connection information</h3>
+        <p>Fill in the Odoo URL, database name, login account and API Key (recommended) in the "Connection settings" page.<br>
+        You can also define constants in <code>wp-config.php</code>:</p>
         <pre style="background:#f0f0f0;padding:12px;border-radius:6px;">define( 'LOC_ODOO_URL',      'https://mycompany.odoo.com' );
 define( 'LOC_ODOO_DB',       'mycompany' );
 define( 'LOC_ODOO_USER',     'admin@mycompany.com' );
 define( 'LOC_ODOO_PASSWORD', 'your_api_key' );</pre>
 
-        <h3>③ 配置 Odoo Webhook（发货回调）</h3>
-        <p>在 Odoo 后台：<strong>设置 → 技术 → 自动化动作</strong>，新建一条规则：</p>
+        <h3>Odoo API version</h3>
         <ul>
-            <li>模型：<code>stock.picking</code></li>
-            <li>触发：记录被修改，字段 <code>state</code> 变为 <code>done</code></li>
-            <li>动作类型：执行代码</li>
+            <li><strong>Default JSON-2</strong> (<code>POST /json/2/&lt;model&gt;/&lt;method&gt;</code>, <code>Authorization: bearer &lt;API key&gt;</code>) matches Odoo 19’s external API and avoids <code>405 Method Not Allowed</code> on routes that only accept browser session RPC.</li>
+            <li>Use <strong>JSON-RPC</strong> only for self-hosted Odoo 14–18 where <code>/jsonrpc</code> is available; it requires database name, login, and password or API key.</li>
+            <li>On Odoo Online, API access may depend on your <a href="https://www.odoo.com/pricing-plan" target="_blank" rel="noopener noreferrer">pricing plan</a>.</li>
+        </ul>
+
+        <h3>③ Configure Odoo Webhook (delivery callback)</h3>
+        <p>In Odoo backend: <strong>Settings → Technical → Automated actions</strong>, create a new rule:</p>
+        <ul>
+            <li>Model: <code>stock.picking</code></li>
+            <li>Trigger: Record is modified, field <code>state</code> becomes <code>done</code></li>
+            <li>Action type: Execute code</li>
         </ul>
         <pre style="background:#f0f0f0;padding:12px;border-radius:6px;">import requests, json
 for pick in records:
@@ -234,23 +264,23 @@ for pick in records:
         timeout=10
     )</pre>
 
-        <h3>④ 配置 Odoo 库存实时推送（可选）</h3>
-        <p>同上，模型改为 <code>stock.quant</code>，触发字段 <code>quantity</code>，推送到：</p>
+        <h3>④ Configure Odoo inventory real-time push (optional)</h3>
+        <p>Same as above, change the model to <code>stock.quant</code>, trigger field <code>quantity</code>, push to:</p>
         <pre style="background:#f0f0f0;padding:12px;border-radius:6px;">POST https://your-wp-site.com/wp-json/loc/v1/inventory-update
 Body: {"odoo_product_id": 42, "qty_available": 15.0}</pre>
 
-        <h3>⑤ 数据流全览</h3>
+        <h3>⑤ Data flow overview</h3>
         <table class="wp-list-table widefat striped">
-            <thead><tr><th>事件</th><th>方向</th><th>说明</th></tr></thead>
+            <thead><tr><th>Event</th><th>Direction</th><th>Description</th></tr></thead>
             <tbody>
-                <tr><td>用户注册 / 更新地址</td><td>WP → Odoo</td><td>同步为 res.partner，带会员编号</td></tr>
-                <tr><td>商品保存</td><td>WP → Odoo</td><td>推送名称、价格、SKU</td></tr>
-                <tr><td>定时拉取（每小时）</td><td>Odoo → WP</td><td>同步商品信息、价格</td></tr>
-                <tr><td>定时拉取（每 15 分钟）</td><td>Odoo → WP</td><td>同步库存数量</td></tr>
-                <tr><td>客户下单（processing）</td><td>WP → Odoo</td><td>创建 sale.order 并确认</td></tr>
-                <tr><td>订单完成（completed）</td><td>WP → Odoo</td><td>生成账单并过账，触发出库</td></tr>
-                <tr><td>Odoo 发货完成</td><td>Odoo → WP</td><td>回写运单号，WC 订单标为完成</td></tr>
-                <tr><td>订单取消 / 退款</td><td>WP → Odoo</td><td>取消 sale.order / 冲销账单</td></tr>
+                <tr><td>User registration / update address</td><td>WP → Odoo</td><td>Sync to res.partner, with membership number</td></tr>
+                <tr><td>Product save</td><td>WP → Odoo</td><td>Push name, price, SKU</td></tr>
+                <tr><td>Scheduled pull (hourly)</td><td>Odoo → WP</td><td>Sync product info & price</td></tr>
+                <tr><td>Scheduled pull (every 15 minutes)</td><td>Odoo → WP</td><td>Sync inventory quantity</td></tr>
+                <tr><td>Customer checkout (processing)</td><td>WP → Odoo</td><td>Create sale.order and confirm</td></tr>
+                <tr><td>Order completed</td><td>WP → Odoo</td><td>Create and post invoice, validate delivery</td></tr>
+                <tr><td>Odoo delivery completed</td><td>Odoo → WP</td><td>Write back tracking number, mark WC order as completed</td></tr>
+                <tr><td>Order canceled / refunded</td><td>WP → Odoo</td><td>Cancel sale.order / reverse invoice</td></tr>
             </tbody>
         </table>
         </div>
@@ -274,9 +304,9 @@ Body: {"odoo_product_id": 42, "qty_available": 15.0}</pre>
 
         $uid = LOC_API::authenticate();
         if ( $uid ) {
-            wp_send_json_success( "✅ 连接成功！Odoo 用户 ID：{$uid}" );
+            wp_send_json_success( "✅ Connection successful! Odoo user ID: {$uid}" );
         } else {
-            wp_send_json_error( '❌ 连接失败，请检查 URL / 数据库 / 用户名 / 密码。' );
+            wp_send_json_error( '❌ Connection failed, please check URL / database / username / password.' );
         }
     }
 
@@ -293,7 +323,7 @@ Body: {"odoo_product_id": 42, "qty_available": 15.0}</pre>
 
         ob_start();
         echo '<table class="wp-list-table widefat striped" style="font-size:12px">';
-        echo '<thead><tr><th>ID</th><th>类型</th><th>WC ID</th><th>Odoo ID</th><th>状态</th><th>信息</th><th>时间</th></tr></thead><tbody>';
+        echo '<thead><tr><th>ID</th><th>Type</th><th>WC ID</th><th>Odoo ID</th><th>Status</th><th>Message</th><th>Time</th></tr></thead><tbody>';
         foreach ( $rows as $r ) {
             $color = $r->status === 'ok' ? '#0a5' : '#c00';
             echo "<tr><td>{$r->id}</td><td><code>{$r->sync_type}</code></td><td>{$r->object_id}</td><td>{$r->odoo_id}</td>";

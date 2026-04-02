@@ -9,34 +9,34 @@ jQuery( function ( $ ) {
 
     // Connection test
     $( '#loc-test-btn' ).on( 'click', function () {
-        var $btn = $( this ).prop( 'disabled', true ).text( '测试中…' );
+        var $btn = $( this ).prop( 'disabled', true ).text( 'Testing…' );
         var $result = $( '#loc-test-result' );
         $.post( locAdmin.ajax_url, { action: 'loc_test_connection', nonce: locAdmin.nonce } )
             .done( function ( res ) {
                 $result.css( 'color', res.success ? '#0a5' : '#c00' ).text( res.data );
             } )
-            .always( function () { $btn.prop( 'disabled', false ).text( '🧪 测试 Odoo 连接' ); } );
+            .always( function () { $btn.prop( 'disabled', false ).text( '🧪 Test Odoo connection' ); } );
     } );
 
     // Manual sync buttons
     $( '.loc-sync-btn' ).on( 'click', function () {
-        var $btn    = $( this ).prop( 'disabled', true ).text( '同步中…' );
+        var $btn    = $( this ).prop( 'disabled', true ).text( 'Syncing…' );
         var action  = $btn.data( 'action' );
         var $result = $( '#loc-sync-result' );
         $.post( locAdmin.ajax_url, { action: action, nonce: locAdmin.nonce } )
             .done( function ( res ) {
                 $result.text( res.success ? '✅ ' + res.data : '❌ ' + res.data );
             } )
-            .always( function () { $btn.prop( 'disabled', false ).text( '立即同步' ); } );
+            .always( function () { $btn.prop( 'disabled', false ).text( 'Sync now' ); } );
     } );
 
     // Load log
     $( '#loc-load-log' ).on( 'click', function () {
-        var $btn = $( this ).prop( 'disabled', true ).text( '加载中…' );
+        var $btn = $( this ).prop( 'disabled', true ).text( 'Loading…' );
         $.post( locAdmin.ajax_url, { action: 'loc_view_log', nonce: locAdmin.nonce } )
             .done( function ( res ) {
                 if ( res.success ) { $( '#loc-log-container' ).html( res.data ); }
             } )
-            .always( function () { $btn.prop( 'disabled', false ).text( '加载日志' ); } );
+            .always( function () { $btn.prop( 'disabled', false ).text( 'Load logs' ); } );
     } );
 } );
