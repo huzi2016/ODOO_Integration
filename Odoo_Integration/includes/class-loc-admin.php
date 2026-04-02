@@ -20,13 +20,13 @@ class LOC_Admin {
     }
 
     public static function add_menu(): void {
-        add_submenu_page(
-            'woocommerce',
+        add_menu_page(
             'Odoo Connector',
             'Odoo Connector',
             'manage_options',
             'loc-odoo-connector',
-            [ __CLASS__, 'render_page' ]
+            [ __CLASS__, 'render_page' ],
+            'dashicons-networking'
         );
     }
 
@@ -227,7 +227,7 @@ class LOC_Admin {
         <p>Upload the <code>limo-odoo-connector/</code> folder to <code>wp-content/plugins/</code>, and enable it in the backend.</p>
 
         <h3>② Configure connection information</h3>
-        <p>Fill in the Odoo URL, database name, login account and API Key (recommended) in the "Connection settings" page.<br>
+        <p>In the WordPress admin sidebar, open <strong>Odoo Connector</strong> and fill in the Odoo URL, database name, login (for JSON-RPC), and API key.<br>
         You can also define constants in <code>wp-config.php</code>:</p>
         <pre style="background:#f0f0f0;padding:12px;border-radius:6px;">define( 'LOC_ODOO_URL',      'https://mycompany.odoo.com' );
 define( 'LOC_ODOO_DB',       'mycompany' );

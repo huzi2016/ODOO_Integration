@@ -320,7 +320,7 @@ class LOC_Order_Sync {
      *   "event":      "delivery_done",
      *   "wc_order_id": 123,
      *   "tracking":   "SF1234567890",
-     *   "carrier":    "顺丰速运"
+     *   "carrier":    "UPS"
      * }
      */
     public static function handle_odoo_callback( WP_REST_Request $request ): WP_REST_Response {
