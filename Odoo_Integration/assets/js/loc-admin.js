@@ -90,11 +90,12 @@ jQuery( function ( $ ) {
         $result.css( 'color', '#888' ).text( 'Sending to Odoo…' );
         $.post( locAdmin.ajax_url, { action: 'loc_push_order', nonce: locAdmin.nonce, order_id: orderId } )
             .done( function ( res ) {
-                if ( res.success ) {
-                    var sid = res.data && res.data.odoo_sale_id ? res.data.odoo_sale_id : '?';
-                    $result.css( 'color', '#0a5' ).text( '✅ Odoo sale.order created: SO#' + sid + ' — check the WC order notes for details.' );
+                if ( res.success && res.data && res.data.odoo_sale_id > 0 ) {
+                    $result.css( 'color', '#0a5' ).text( '✅ Odoo sale.order created: SO#' + res.data.odoo_sale_id + ' — check the WC order notes for details.' );
+                } else if ( res.success && res.data && res.data.already_exists ) {
+                    $result.css( 'color', '#888' ).text( 'ℹ️ Already synced: SO#' + res.data.odoo_sale_id + ' — order was previously created in Odoo.' );
                 } else {
-                    $result.css( 'color', '#c00' ).text( '❌ ' + ( res.data || 'Unknown error — check Sync Log tab.' ) );
+                    $result.css( 'color', '#c00' ).text( '❌ Failed to create Odoo sale order — check Sync Log tab for details.' );
                 }
             } )
             .fail( function () { $result.css( 'color', '#c00' ).text( '❌ AJAX request failed.' ); } )

@@ -87,11 +87,18 @@ class LOC_Customer_Sync {
         $existing_odoo_id = (int) get_user_meta( $user_id, '_loc_odoo_partner_id', true );
 
         if ( $existing_odoo_id > 0 ) {
-            // Verify the partner still exists before writing (may have been deleted in Odoo).
-            $check = LOC_API::read( 'res.partner', [ $existing_odoo_id ], [ 'id' ] );
+            // Use search() with active=true rather than read() — read() may succeed for
+            // archived partners in some Odoo permission contexts but they still cannot be
+            // used as sale.order partner_id. search() respects the same active domain that
+            // sale.order's partner_id field enforces.
+            $check = LOC_API::search(
+                'res.partner',
+                [ [ 'id', '=', $existing_odoo_id ], [ 'active', '=', true ] ],
+                [ 'limit' => 1 ]
+            );
             if ( empty( $check ) ) {
                 LOC_API::log( 'customer_sync', $user_id, $existing_odoo_id, 'error',
-                    "Cached partner {$existing_odoo_id} no longer exists in Odoo — clearing and re-creating." );
+                    "Cached partner {$existing_odoo_id} not found as active in Odoo — clearing and re-creating." );
                 delete_user_meta( $user_id, '_loc_odoo_partner_id' );
                 clean_user_cache( $user_id );
                 $existing_odoo_id = 0;
@@ -109,17 +116,17 @@ class LOC_Customer_Sync {
         }
 
         // Check by email in Odoo first (avoid duplicates on re-installs).
-        // Search without parent_id constraint so we also pick up partners created by
-        // the Odoo wp_sync_customer module (which sets parent_id = False by default).
+        // Explicitly include active=true so archived partners are never matched —
+        // archived partners can appear in some Odoo search contexts but cannot be
+        // used as sale.order partner_id and must be treated as non-existent.
         $found = LOC_API::search(
             'res.partner',
-            [ [ 'email', '=', $wp_user->user_email ], [ 'parent_id', '=', false ] ],
+            [ [ 'email', '=', $wp_user->user_email ], [ 'parent_id', '=', false ], [ 'active', '=', true ] ],
             [ 'limit' => 1 ]
         );
         if ( is_array( $found ) && ! empty( $found ) ) {
             $odoo_id = (int) $found[0];
             LOC_API::write( 'res.partner', [ $odoo_id ], $vals );
-            // Always overwrite — the cached value may point to a deleted/replaced partner.
             update_user_meta( $user_id, '_loc_odoo_partner_id', $odoo_id );
             LOC_API::log( 'customer_sync', $user_id, $odoo_id, 'ok', 'Linked to existing partner (cache refreshed)' );
             return $odoo_id;

@@ -135,12 +135,18 @@ class LOC_Order_Sync {
         if ( $customer_id > 0 ) {
             $odoo_partner_id = (int) get_user_meta( $customer_id, '_loc_odoo_partner_id', true );
 
-            // Verify cached partner still exists in Odoo (may have been deleted/recreated).
+            // Verify cached partner is active in Odoo. Use search() with active=true
+            // (same domain sale.order applies) rather than read(), which can succeed for
+            // archived partners that are still rejected by sale.order's partner_id field.
             if ( $odoo_partner_id > 0 ) {
-                $check = LOC_API::read( 'res.partner', [ $odoo_partner_id ], [ 'id' ] );
+                $check = LOC_API::search(
+                    'res.partner',
+                    [ [ 'id', '=', $odoo_partner_id ], [ 'active', '=', true ] ],
+                    [ 'limit' => 1 ]
+                );
                 if ( empty( $check ) ) {
                     LOC_API::log( 'order_push', $order_id, $odoo_partner_id, 'error',
-                        "Cached partner {$odoo_partner_id} no longer exists in Odoo — clearing cache and re-syncing." );
+                        "Cached partner {$odoo_partner_id} is not active in Odoo — clearing cache and re-syncing." );
                     delete_user_meta( $customer_id, '_loc_odoo_partner_id' );
                     clean_user_cache( $customer_id );
                     $odoo_partner_id = 0;
@@ -246,6 +252,14 @@ class LOC_Order_Sync {
         if ( $shipping_partner_id > 0 ) {
             $sale_vals['partner_shipping_id'] = $shipping_partner_id;
         }
+
+        // Diagnostic: log what we're about to send to Odoo.
+        $line_summary = implode( ', ', array_map(
+            static fn( $l ) => 'pid=' . ( $l[2]['product_id'] ?? 'none' ) . ' qty=' . ( $l[2]['product_uom_qty'] ?? '?' ),
+            $order_lines
+        ) );
+        LOC_API::log( 'order_push', $order_id, $odoo_partner_id, 'ok',
+            "Attempting create sale.order: partner_id={$odoo_partner_id}, lines=[{$line_summary}]" );
 
         $sale_id = LOC_API::create( 'sale.order', $sale_vals );
         delete_transient( $lock_key );
@@ -528,8 +542,13 @@ class LOC_Order_Sync {
             return 0;
         }
 
-        // Reuse existing partner by email to avoid duplicates.
-        $found = LOC_API::search( 'res.partner', [ [ 'email', '=', $email ] ], [ 'limit' => 1 ] );
+        // Reuse existing partner by email — only if active. Archived partners can appear
+        // in Odoo email searches but cannot be used as sale.order partner_id.
+        $found = LOC_API::search(
+            'res.partner',
+            [ [ 'email', '=', $email ], [ 'active', '=', true ] ],
+            [ 'limit' => 1 ]
+        );
         if ( is_array( $found ) && ! empty( $found ) ) {
             $id = (int) $found[0];
             LOC_API::write( 'res.partner', [ $id ], self::billing_partner_vals( $order ) );
@@ -666,7 +685,16 @@ class LOC_Order_Sync {
         if ( ! $order ) {
             wp_send_json_error( 'Order not found.' );
         }
+        // Check if already synced before attempting.
+        $existing_sale_id = (int) $order->get_meta( '_loc_odoo_sale_id' );
+        if ( $existing_sale_id > 0 ) {
+            wp_send_json_success( [ 'odoo_sale_id' => $existing_sale_id, 'already_exists' => true ] );
+        }
+
         $sale_id = self::create_sale_order( $order );
-        wp_send_json_success( [ 'odoo_sale_id' => $sale_id ] );
+        if ( $sale_id > 0 ) {
+            wp_send_json_success( [ 'odoo_sale_id' => $sale_id ] );
+        }
+        wp_send_json_error( 'create_sale_order() returned 0 — check Sync Log for the json2 error above this entry.' );
     }
 }
