@@ -70,6 +70,7 @@ class LOC_Product_Sync {
 
         $offset   = 0;
         $total    = 0;
+        $skipped  = 0;
         $page     = 0;
         $fetched  = 0;
 
@@ -120,8 +121,12 @@ class LOC_Product_Sync {
                 }
                 $tid = (int) $rec['id'];
                 $rec['qty_available'] = $qty_by_tmpl[ $tid ] ?? 0.0;
-                self::upsert_wc_product( $rec );
-                ++$total;
+                $out = self::upsert_wc_product( $rec );
+                if ( $out === 'skipped' ) {
+                    ++$skipped;
+                } elseif ( $out === 'saved' ) {
+                    ++$total;
+                }
             }
 
             $fetched = count( $ids );
@@ -133,7 +138,8 @@ class LOC_Product_Sync {
             $suffix = " — stopped at page cap ({$max_pages}); more products may exist in Odoo (raise loc_odoo_product_pull_max_pages).";
         }
 
-        LOC_API::log( 'product_pull', 0, 0, 'ok', "Pull finished: {$total} Odoo product template(s) processed.{$suffix}" );
+        $skip_msg = $skipped > 0 ? " {$skipped} duplicate Internal Reference(s) skipped (same SKU already mapped)." : '';
+        LOC_API::log( 'product_pull', 0, 0, 'ok', "Pull finished: {$total} product(s) saved.{$skip_msg}{$suffix}" );
     }
 
     /**
@@ -166,9 +172,25 @@ class LOC_Product_Sync {
     }
 
     /**
-     * WooCommerce SKUs must be unique. Odoo often has several product.template rows sharing the same Internal Reference.
+     * Odoo may store Internal Reference as [AN5648]; normalize so duplicate detection matches WooCommerce SKU AN5648.
      */
-    private static function resolve_pull_sku( string $default_code, int $odoo_template_id ): string {
+    private static function normalize_internal_reference( string $code ): string {
+        $code = trim( $code );
+        if ( $code === '' ) {
+            return '';
+        }
+        return trim( $code, " \t\n\r\0\x0B[]" );
+    }
+
+    /**
+     * WooCommerce SKUs must be unique. Several Odoo product.template rows often share the same Internal Reference.
+     *
+     * Default: only one WC product per Internal Reference — extra templates are skipped (see filter
+     * loc_odoo_skip_duplicate_internal_reference_templates). Legacy behaviour: append -T&lt;template_id&gt;.
+     *
+     * @return string|null SKU to use, or null when this template is skipped as a duplicate.
+     */
+    private static function resolve_pull_sku( string $default_code, int $odoo_template_id ): ?string {
         $base = sanitize_text_field( $default_code );
         if ( $base === '' ) {
             return self::fallback_sku_for_template( $odoo_template_id );
@@ -183,6 +205,12 @@ class LOC_Product_Sync {
         $linked_odoo = (int) get_post_meta( $pid, '_loc_odoo_product_id', true );
         if ( $linked_odoo === $odoo_template_id ) {
             return $base;
+        }
+        if ( $linked_odoo === 0 ) {
+            return $base;
+        }
+        if ( apply_filters( 'loc_odoo_skip_duplicate_internal_reference_templates', true ) ) {
+            return null;
         }
         $extra = (string) apply_filters( 'loc_odoo_duplicate_sku_suffix', '-T' . $odoo_template_id, $odoo_template_id, $base );
         return $base . $extra;
@@ -221,11 +249,35 @@ class LOC_Product_Sync {
      * Create or update a WooCommerce product from an Odoo product.template record.
      *
      * @param array $rec Odoo product.template fields.
+     * @return 'saved'|'skipped'|'error'
      */
-    private static function upsert_wc_product( array $rec ): void {
+    private static function upsert_wc_product( array $rec ): string {
         $odoo_id = (int) $rec['id'];
 
+        $base_code = ! empty( $rec['default_code'] ) ? (string) $rec['default_code'] : '';
+        $base_code = self::strip_duplicate_resolution_suffixes( $base_code );
+        $base_code = self::normalize_internal_reference( $base_code );
+        $base_code = (string) apply_filters( 'loc_odoo_normalize_internal_reference', $base_code, $rec );
+
+        $sku = self::resolve_pull_sku( $base_code, $odoo_id );
+        if ( $sku === null ) {
+            if ( apply_filters( 'loc_odoo_log_skipped_duplicate_templates', false ) ) {
+                LOC_API::log( 'product_pull', 0, $odoo_id, 'ok', 'Skipped duplicate Internal Reference (SKU already used by another Odoo template).' );
+            }
+            return 'skipped';
+        }
+
         $existing_wc_id = self::find_wc_product_id_for_odoo_template( $odoo_id );
+        if ( $existing_wc_id <= 0 && function_exists( 'wc_get_product_id_by_sku' ) && $sku !== '' ) {
+            $by_sku = wc_get_product_id_by_sku( $sku );
+            if ( $by_sku ) {
+                $linked = (int) get_post_meta( $by_sku, '_loc_odoo_product_id', true );
+                if ( $linked === 0 || $linked === $odoo_id ) {
+                    $existing_wc_id = (int) $by_sku;
+                }
+            }
+        }
+
         if ( $existing_wc_id > 0 ) {
             $product = wc_get_product( $existing_wc_id );
             if ( ! $product ) {
@@ -243,9 +295,6 @@ class LOC_Product_Sync {
             $product->set_description( wp_kses_post( $rec['description_sale'] ) );
         }
 
-        $base_code = ! empty( $rec['default_code'] ) ? (string) $rec['default_code'] : '';
-        $base_code = self::strip_duplicate_resolution_suffixes( $base_code );
-        $sku       = self::resolve_pull_sku( $base_code, $odoo_id );
         $product->set_sku( $sku );
 
         // Manage stock based on Odoo qty
@@ -258,6 +307,7 @@ class LOC_Product_Sync {
             $wc_id = $product->save();
         } catch ( \Throwable $e ) {
             LOC_API::log( 'product_pull', 0, $odoo_id, 'error', 'WC save failed: ' . $e->getMessage() );
+            return 'error';
         }
 
         if ( $wc_id ) {
@@ -267,7 +317,10 @@ class LOC_Product_Sync {
             if ( apply_filters( 'loc_odoo_log_each_product_pull_success', false ) ) {
                 LOC_API::log( 'product_pull', $wc_id, $odoo_id, 'ok', "Upserted '{$rec['name']}'" );
             }
+            return 'saved';
         }
+
+        return 'error';
     }
 
     // ════════════════════════════════════════════════════════════════════════
