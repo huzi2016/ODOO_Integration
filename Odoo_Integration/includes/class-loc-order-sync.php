@@ -45,19 +45,29 @@ class LOC_Order_Sync {
     // ════════════════════════════════════════════════════════════════════════
 
     public static function on_order_created( WC_Order $order ): void {
-        self::create_sale_order( $order );
+        $sale_id = self::create_sale_order( $order );
+        // If the order is already processing when created (e.g. instant payment),
+        // confirm immediately — on_processing will be a no-op due to the transient lock.
+        if ( $sale_id > 0 && $order->has_status( 'processing' ) ) {
+            LOC_API::call( 'sale.order', 'action_confirm', [ [ $sale_id ] ] );
+            LOC_API::log( 'order_confirm', $order->get_id(), $sale_id, 'ok', 'Sale order confirmed (from on_order_created)' );
+        }
     }
 
     public static function on_processing( int $order_id ): void {
-        $order    = wc_get_order( $order_id );
-        $sale_id  = (int) $order->get_meta( '_loc_odoo_sale_id' );
+        $order   = wc_get_order( $order_id );
+        $sale_id = (int) $order->get_meta( '_loc_odoo_sale_id' );
         if ( $sale_id <= 0 ) {
             $sale_id = self::create_sale_order( $order );
         }
-        // Confirm the sale order in Odoo
         if ( $sale_id > 0 ) {
-            LOC_API::call( 'sale.order', 'action_confirm', [ [ $sale_id ] ] );
-            LOC_API::log( 'order_confirm', $order_id, $sale_id, 'ok', 'Sale order confirmed' );
+            // Guard: only confirm once — sale.order may already be in 'sale' state.
+            $states = LOC_API::read( 'sale.order', [ $sale_id ], [ 'state' ] );
+            $state  = is_array( $states ) && ! empty( $states ) ? ( $states[0]['state'] ?? '' ) : '';
+            if ( $state !== 'sale' && $state !== 'done' ) {
+                LOC_API::call( 'sale.order', 'action_confirm', [ [ $sale_id ] ] );
+                LOC_API::log( 'order_confirm', $order_id, $sale_id, 'ok', 'Sale order confirmed' );
+            }
         }
     }
 
@@ -102,8 +112,20 @@ class LOC_Order_Sync {
     public static function create_sale_order( WC_Order $order ): int {
         $order_id = $order->get_id();
 
-        // Ensure the customer exists in Odoo
-        $customer_id = (int) $order->get_customer_id();
+        // ── Idempotency: bail if already created (handles on_order_created + on_processing race) ──
+        $existing = (int) $order->get_meta( '_loc_odoo_sale_id' );
+        if ( $existing > 0 ) {
+            return $existing;
+        }
+        // Transient lock: prevent concurrent requests from double-creating.
+        $lock_key = 'loc_order_creating_' . $order_id;
+        if ( get_transient( $lock_key ) ) {
+            return 0;
+        }
+        set_transient( $lock_key, 1, 30 );
+
+        // ── Resolve Odoo partner ──────────────────────────────────────────────
+        $customer_id     = (int) $order->get_customer_id();
         $odoo_partner_id = 0;
         if ( $customer_id > 0 ) {
             $odoo_partner_id = (int) get_user_meta( $customer_id, '_loc_odoo_partner_id', true );
@@ -111,39 +133,52 @@ class LOC_Order_Sync {
                 $odoo_partner_id = LOC_Customer_Sync::upsert_partner( $customer_id );
             }
         } else {
-            // Guest checkout — create a one-off partner
             $odoo_partner_id = self::create_guest_partner( $order );
         }
 
         if ( $odoo_partner_id <= 0 ) {
+            delete_transient( $lock_key );
             LOC_API::log( 'order_push', $order_id, 0, 'error', 'Could not resolve Odoo partner' );
             return 0;
         }
 
-        // Build order lines
+        // ── Build order lines ─────────────────────────────────────────────────
+        // sale.order.line.product_id MUST be a product.product (variant) id, NOT product.template id.
+        // We store the variant id in _loc_odoo_variant_id during product pull (since v1.2.9).
+        // Runtime fallback: search product.product where product_tmpl_id = template_id.
         $order_lines = [];
         foreach ( $order->get_items() as $item ) {
-            $product    = $item->get_product();
-            $odoo_prod  = 0;
+            $product        = $item->get_product();
+            $odoo_variant   = 0;
+
             if ( $product ) {
-                $odoo_prod = (int) get_post_meta( $product->get_id(), '_loc_odoo_product_id', true );
+                $wc_id        = $product->get_id();
+                $odoo_variant = (int) get_post_meta( $wc_id, '_loc_odoo_variant_id', true );
+
+                if ( $odoo_variant <= 0 ) {
+                    // Fallback A: look up via template id
+                    $tmpl_id = (int) get_post_meta( $wc_id, '_loc_odoo_product_id', true );
+                    if ( $tmpl_id > 0 ) {
+                        $odoo_variant = self::get_variant_id_from_template( $tmpl_id );
+                    }
+                }
             }
 
-            if ( $odoo_prod <= 0 ) {
-                // Fallback: find by name
+            if ( $odoo_variant <= 0 ) {
+                // Fallback B: search product.product by name
                 $found = LOC_API::search(
-                    'product.template',
+                    'product.product',
                     [ [ 'name', '=', $item->get_name() ] ],
                     [ 'limit' => 1 ]
                 );
-                $odoo_prod = ( is_array( $found ) && ! empty( $found ) ) ? (int) $found[0] : 0;
+                $odoo_variant = ( is_array( $found ) && ! empty( $found ) ) ? (int) $found[0] : 0;
             }
 
             $line = [
-                'product_id'    => $odoo_prod ?: false,
-                'name'          => $item->get_name(),
+                'product_id'      => $odoo_variant ?: false,
+                'name'            => $item->get_name(),
                 'product_uom_qty' => (float) $item->get_quantity(),
-                'price_unit'    => (float) $order->get_item_subtotal( $item ),
+                'price_unit'      => (float) $order->get_item_subtotal( $item, false, false ),
             ];
             $order_lines[] = [ 0, 0, $line ];
         }
@@ -186,15 +221,17 @@ class LOC_Order_Sync {
         }
 
         $sale_id = LOC_API::create( 'sale.order', $sale_vals );
+        delete_transient( $lock_key );
+
         if ( $sale_id ) {
             $order->update_meta_data( '_loc_odoo_sale_id', $sale_id );
             $order->save_meta_data();
             $order->add_order_note( "Odoo sale order created: SO#{$sale_id}" );
             LOC_API::log( 'order_push', $order_id, $sale_id, 'ok', 'Sale order created' );
-            return $sale_id;
+            return (int) $sale_id;
         }
 
-        LOC_API::log( 'order_push', $order_id, 0, 'error', 'create() failed' );
+        LOC_API::log( 'order_push', $order_id, 0, 'error', 'create() failed — check LOC_ODOO_WRITES_ALLOWED in wp-config.php' );
         return 0;
     }
 
@@ -211,26 +248,45 @@ class LOC_Order_Sync {
     private static function create_and_post_invoice( WC_Order $order, int $sale_id ): void {
         $order_id = $order->get_id();
 
-        // Trigger Odoo's native invoice creation from sale lines
-        $invoice_ids = LOC_API::call(
-            'sale.order',
-            'action_invoice_create',
-            [ [ $sale_id ] ]
+        // Odoo 17+: _create_invoices (replaces action_invoice_create which was removed in v16).
+        // The method returns nothing useful; we then search for the created account.move.
+        LOC_API::call( 'sale.order', '_create_invoices', [ [ $sale_id ] ] );
+
+        // Fetch the invoice linked to this sale order (may take a moment; search is reliable).
+        $invoice_ids = LOC_API::search(
+            'account.move',
+            [
+                [ 'move_type', '=', 'out_invoice' ],
+                [ 'invoice_origin', '=', false ],   // placeholder — override below
+            ],
+            [ 'limit' => 1 ]
+        );
+        // Better: search via sale line origin
+        $invoice_ids = LOC_API::search(
+            'account.move',
+            [
+                [ 'move_type', '=', 'out_invoice' ],
+                [ 'state', '=', 'draft' ],
+                [ 'invoice_line_ids.sale_line_ids.order_id', '=', $sale_id ],
+            ],
+            [ 'limit' => 1 ]
         );
 
-        // Fallback: newer Odoo versions use _create_invoices
+        // Fallback: try to find via partner + order ref
         if ( ! is_array( $invoice_ids ) || empty( $invoice_ids ) ) {
-            LOC_API::call( 'sale.order', '_create_invoices', [ [ $sale_id ] ] );
-            // Fetch the newly created invoice
             $invoice_ids = LOC_API::search(
                 'account.move',
-                [ [ 'invoice_origin', 'like', 'WC#' . $order_id ] ],
+                [
+                    [ 'move_type', '=', 'out_invoice' ],
+                    [ 'state', '=', 'draft' ],
+                    [ 'invoice_origin', 'like', (string) $sale_id ],
+                ],
                 [ 'limit' => 1 ]
             );
         }
 
         if ( ! is_array( $invoice_ids ) || empty( $invoice_ids ) ) {
-            LOC_API::log( 'invoice_create', $order_id, $sale_id, 'error', 'No invoice created' );
+            LOC_API::log( 'invoice_create', $order_id, $sale_id, 'error', 'Invoice not found after _create_invoices' );
             return;
         }
 
@@ -410,6 +466,27 @@ class LOC_Order_Sync {
             'city'      => sanitize_text_field( $order->get_shipping_city() ),
             'zip'       => sanitize_text_field( $order->get_shipping_postcode() ),
         ] );
+    }
+
+    /**
+     * Resolve a product.product (variant) id from a product.template id.
+     * sale.order.line.product_id requires product.product, not product.template.
+     * Cached per request in a static map to avoid repeated API calls for the same template.
+     */
+    private static function get_variant_id_from_template( int $template_id ): int {
+        static $cache = [];
+        if ( $template_id <= 0 ) {
+            return 0;
+        }
+        if ( ! isset( $cache[ $template_id ] ) ) {
+            $ids = LOC_API::search(
+                'product.product',
+                [ [ 'product_tmpl_id', '=', $template_id ] ],
+                [ 'limit' => 1, 'order' => 'id asc' ]
+            );
+            $cache[ $template_id ] = ( is_array( $ids ) && ! empty( $ids ) ) ? (int) $ids[0] : 0;
+        }
+        return $cache[ $template_id ];
     }
 
     // Admin AJAX: push single order

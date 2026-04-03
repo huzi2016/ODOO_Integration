@@ -20,8 +20,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class LOC_Product_Sync {
 
-    // Odoo product.template fields (no qty_available: invalid on template in Odoo 17+ / 19 — use variants via LOC_API::sum_qty_available_by_template_ids).
-    const ODOO_FIELDS = [ 'id', 'name', 'description_sale', 'list_price', 'active', 'default_code' ];
+    // Odoo product.template fields (no qty_available: invalid on template in Odoo 17+ / 19).
+    // product_variant_ids: needed to store the product.product id used in sale.order lines.
+    const ODOO_FIELDS = [ 'id', 'name', 'description_sale', 'list_price', 'active', 'default_code', 'product_variant_ids' ];
 
     public static function init(): void {
         // ── Register cron intervals ──────────────────────────────────────────
@@ -721,6 +722,12 @@ class LOC_Product_Sync {
             update_post_meta( $wc_id, '_loc_odoo_product_id',      $odoo_id );
             update_post_meta( $wc_id, '_loc_odoo_product_tmpl_id', $odoo_id );
             update_post_meta( $wc_id, '_loc_last_synced',          gmdate( 'Y-m-d H:i:s' ) );
+
+            // Store first product.product (variant) id — sale.order lines require product.product, not product.template.
+            $variant_ids = $rec['product_variant_ids'] ?? [];
+            if ( is_array( $variant_ids ) && ! empty( $variant_ids ) ) {
+                update_post_meta( $wc_id, '_loc_odoo_variant_id', (int) $variant_ids[0] );
+            }
             if ( $prev_linked > 0 && $prev_linked !== $odoo_id ) {
                 LOC_API::log( 'product_pull', $wc_id, $odoo_id, 'ok', "Reclaimed WC product from polluted template {$prev_linked} → clean template {$odoo_id} ('{$rec['name']}')." );
             } elseif ( apply_filters( 'loc_odoo_log_each_product_pull_success', false ) ) {
