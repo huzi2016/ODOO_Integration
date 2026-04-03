@@ -241,6 +241,14 @@ define( 'LOC_ODOO_PASSWORD', 'your_api_key' );</pre>
             <li>On Odoo Online, API access may depend on your <a href="https://www.odoo.com/pricing-plan" target="_blank" rel="noopener noreferrer">pricing plan</a>.</li>
         </ul>
 
+        <h3>Products: Odoo list vs this plugin</h3>
+        <ul>
+            <li><strong>Inventory → Products</strong> in Odoo lists <code>product.product</code> rows (variants). The counter (e.g. 268) is usually <strong>not</strong> the same as the number of <code>product.template</code> records. This plugin pulls <strong>templates</strong> (one WooCommerce product per template).</li>
+            <li>Pull domain default: <code>active</code> and <code>sale_ok</code>. To match more or fewer templates, use the WordPress filter <code>loc_odoo_product_template_domain</code> in a small custom plugin or theme.</li>
+            <li>If several Odoo templates share the same Internal Reference, WooCommerce needs <strong>unique SKUs</strong>. The plugin appends <code>-T&lt;odoo_template_id&gt;</code> when the base SKU is already used by another linked product.</li>
+            <li>Templates <strong>without</strong> an Internal Reference get WooCommerce SKU <code>ODOO-T&lt;template_id&gt;</code> so every product has a stable unique key (empty WC SKU caused thousands of duplicate imports before v1.1.7). The plugin strips trailing <code>-T&lt;id&gt;</code> chains from Internal Reference on pull so long snowball SKUs (e.g. <code>AN 5960-T930-T1197-…</code>) do not grow each sync. WordPress does not write product master data back to Odoo. Delete duplicate junk products in WooCommerce manually once, then re-sync.</li>
+        </ul>
+
         <h3>③ Configure Odoo Webhook (delivery callback)</h3>
         <p>In Odoo backend: <strong>Settings → Technical → Automated actions</strong>, create a new rule:</p>
         <ul>
@@ -274,7 +282,7 @@ Body: {"odoo_product_id": 42, "qty_available": 15.0}</pre>
             <thead><tr><th>Event</th><th>Direction</th><th>Description</th></tr></thead>
             <tbody>
                 <tr><td>User registration / update address</td><td>WP → Odoo</td><td>Sync to res.partner, with membership number</td></tr>
-                <tr><td>Product save</td><td>WP → Odoo</td><td>Push name, price, SKU</td></tr>
+                <tr><td>Product save</td><td>—</td><td>No product push to Odoo (Odoo is source of truth for catalog)</td></tr>
                 <tr><td>Scheduled pull (hourly)</td><td>Odoo → WP</td><td>Sync product info & price</td></tr>
                 <tr><td>Scheduled pull (every 15 minutes)</td><td>Odoo → WP</td><td>Sync inventory quantity</td></tr>
                 <tr><td>Customer checkout (processing)</td><td>WP → Odoo</td><td>Create sale.order and confirm</td></tr>

@@ -89,14 +89,9 @@ class LOC_Inventory_Sync {
                 continue; // no change
             }
 
-            // Suppress push-back to Odoo
-            remove_action( 'woocommerce_update_product', [ 'LOC_Product_Sync', 'push_product' ], 20 );
-
             wc_update_product_stock( $product, $qty, 'set' );
             $product->set_stock_status( $qty > 0 ? 'instock' : 'outofstock' );
             $product->save();
-
-            add_action( 'woocommerce_update_product', [ 'LOC_Product_Sync', 'push_product' ], 20 );
 
             LOC_API::log( 'inventory_pull', $wc_id, $odoo_id, 'ok', "Stock: {$old_qty} → {$qty}" );
         }
@@ -150,11 +145,9 @@ class LOC_Inventory_Sync {
             return new WP_REST_Response( [ 'error' => 'wc product load failed' ], 500 );
         }
 
-        remove_action( 'woocommerce_update_product', [ 'LOC_Product_Sync', 'push_product' ], 20 );
         wc_update_product_stock( $product, $qty, 'set' );
         $product->set_stock_status( $qty > 0 ? 'instock' : 'outofstock' );
         $product->save();
-        add_action( 'woocommerce_update_product', [ 'LOC_Product_Sync', 'push_product' ], 20 );
 
         LOC_API::log( 'inventory_push', (int) $wc_ids[0], $odoo_id, 'ok', "Stock set to {$qty}" );
         return new WP_REST_Response( [ 'ok' => true, 'qty' => $qty ], 200 );

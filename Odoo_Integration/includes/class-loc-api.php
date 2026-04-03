@@ -97,11 +97,11 @@ class LOC_API {
     public static function search( string $model, array $domain = [], array $kwargs = [] ): array|false {
         if ( self::api_mode() === 'jsonrpc' ) {
             $r = self::legacy_execute( $model, 'search', [ $domain ], $kwargs );
-            return is_array( $r ) ? $r : false;
+            return self::normalize_id_list_result( $r );
         }
         $body = array_merge( [ 'domain' => $domain ], $kwargs );
         $r    = self::json2_request( $model, 'search', $body );
-        return is_array( $r ) ? $r : false;
+        return self::normalize_id_list_result( $r );
     }
 
     public static function search_read( string $model, array $domain = [], array $fields = [], array $kwargs = [] ): array|false {
@@ -116,12 +116,15 @@ class LOC_API {
     }
 
     public static function read( string $model, array $ids, array $fields = [] ): array|false {
+        if ( $ids === [] ) {
+            return [];
+        }
         if ( self::api_mode() === 'jsonrpc' ) {
             $r = self::legacy_execute( $model, 'read', [ $ids, $fields ], [] );
-            return is_array( $r ) ? $r : false;
+            return self::normalize_search_read_rows( $r );
         }
-        $r = self::json2_request( $model, 'read', [ 'ids' => $ids, 'fields' => $fields ] );
-        return is_array( $r ) ? $r : false;
+        $r = self::json2_request( $model, 'read', [ 'ids' => array_values( $ids ), 'fields' => $fields ] );
+        return self::normalize_search_read_rows( $r );
     }
 
     public static function create( string $model, array $vals ): int|false {
@@ -183,24 +186,35 @@ class LOC_API {
             $chunk = 80;
         }
 
+        $read_chunk = (int) apply_filters( 'loc_odoo_variant_read_chunk', 200 );
+        if ( $read_chunk < 1 ) {
+            $read_chunk = 200;
+        }
+
         for ( $i = 0, $n = count( $ids ); $i < $n; $i += $chunk ) {
             $slice = array_slice( $ids, $i, $chunk );
-            $variants = self::search_read(
+            $pids  = self::search(
                 'product.product',
                 [ [ 'product_tmpl_id', 'in', $slice ] ],
-                [ 'product_tmpl_id', 'qty_available' ],
-                [ 'limit' => 10000 ]
+                [ 'limit' => 10000, 'order' => 'id asc' ]
             );
-            if ( ! is_array( $variants ) ) {
+            if ( ! is_array( $pids ) || $pids === [] ) {
                 continue;
             }
-            foreach ( $variants as $v ) {
-                if ( ! is_array( $v ) ) {
+            for ( $j = 0, $pn = count( $pids ); $j < $pn; $j += $read_chunk ) {
+                $id_chunk = array_slice( $pids, $j, $read_chunk );
+                $variants = self::read( 'product.product', $id_chunk, [ 'product_tmpl_id', 'qty_available' ] );
+                if ( ! is_array( $variants ) ) {
                     continue;
                 }
-                $tid = self::many2one_to_int( $v['product_tmpl_id'] ?? null );
-                if ( $tid > 0 && array_key_exists( $tid, $sums ) ) {
-                    $sums[ $tid ] += (float) ( $v['qty_available'] ?? 0 );
+                foreach ( $variants as $v ) {
+                    if ( ! is_array( $v ) ) {
+                        continue;
+                    }
+                    $tid = self::many2one_to_int( $v['product_tmpl_id'] ?? null );
+                    if ( $tid > 0 && array_key_exists( $tid, $sums ) ) {
+                        $sums[ $tid ] += (float) ( $v['qty_available'] ?? 0 );
+                    }
                 }
             }
         }
@@ -337,6 +351,12 @@ class LOC_API {
      * @param mixed $data Decoded JSON body.
      * @return array<int,array<string,mixed>>|false
      */
+    /**
+     * search() / search_read() / read() — Odoo JSON-2 may return one dict for a single row.
+     *
+     * @param mixed $data Decoded JSON.
+     * @return array<int,array<string,mixed>>|false
+     */
     private static function normalize_search_read_rows( mixed $data ): array|false {
         if ( $data === false || $data === null ) {
             return false;
@@ -347,13 +367,61 @@ class LOC_API {
         if ( $data === [] ) {
             return [];
         }
+        if ( function_exists( 'array_is_list' ) && array_is_list( $data ) ) {
+            if ( isset( $data[0] ) && is_array( $data[0] ) && array_key_exists( 'id', $data[0] ) ) {
+                return $data;
+            }
+            return [];
+        }
         $keys   = array_keys( $data );
         $is_seq = $keys === range( 0, count( $data ) - 1 );
         if ( $is_seq && isset( $data[0] ) && is_array( $data[0] ) && array_key_exists( 'id', $data[0] ) ) {
             return $data;
         }
-        if ( ! $is_seq && isset( $data['id'] ) && is_scalar( $data['id'] ) ) {
+        if ( isset( $data['id'] ) && is_scalar( $data['id'] ) ) {
             return [ $data ];
+        }
+        return false;
+    }
+
+    /**
+     * search() returns a list of integer ids; JSON-2 may return a single id as number.
+     *
+     * @return int[]|false
+     */
+    private static function normalize_id_list_result( mixed $data ): array|false {
+        if ( $data === false || $data === null ) {
+            return false;
+        }
+        if ( is_int( $data ) || is_float( $data ) ) {
+            $i = (int) $data;
+            return $i > 0 ? [ $i ] : [];
+        }
+        if ( is_string( $data ) && ctype_digit( $data ) ) {
+            $i = (int) $data;
+            return $i > 0 ? [ $i ] : [];
+        }
+        if ( ! is_array( $data ) ) {
+            return false;
+        }
+        if ( $data === [] ) {
+            return [];
+        }
+        if ( function_exists( 'array_is_list' ) && array_is_list( $data ) ) {
+            $out = [];
+            foreach ( $data as $x ) {
+                $out[] = (int) $x;
+            }
+            return $out;
+        }
+        $keys   = array_keys( $data );
+        $is_seq = $keys === range( 0, count( $data ) - 1 );
+        if ( $is_seq ) {
+            $out = [];
+            foreach ( $data as $x ) {
+                $out[] = (int) $x;
+            }
+            return $out;
         }
         return false;
     }

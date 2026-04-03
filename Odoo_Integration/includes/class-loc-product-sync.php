@@ -1,9 +1,9 @@
 <?php
 /**
- * LOC_Product_Sync — Two-way product data and inventory sync.
+ * LOC_Product_Sync — Product data from Odoo into WooCommerce (one-way).
  *
- * Flow A  (Odoo → WP)  : scheduled pull — copies Odoo product data to WooCommerce.
- * Flow B  (WP  → Odoo) : push on WC product save — keeps Odoo price/description in sync.
+ * Flow (Odoo → WP): scheduled pull copies Odoo product data to WooCommerce.
+ * WordPress does not write product.template fields back to Odoo (no push).
  *
  * Meta keys stored on WC products:
  *   _loc_odoo_product_id      int   Odoo product.template id
@@ -29,10 +29,6 @@ class LOC_Product_Sync {
             wp_schedule_event( time(), 'hourly', 'loc_sync_products_from_odoo' );
         }
 
-        // ── Push on WC product save (WP → Odoo) ────────────────────────────
-        add_action( 'woocommerce_update_product', [ __CLASS__, 'push_product' ], 20 );
-        add_action( 'woocommerce_new_product',    [ __CLASS__, 'push_product' ], 20 );
-
         // ── Manual trigger via admin AJAX ───────────────────────────────────
         add_action( 'wp_ajax_loc_sync_products', [ __CLASS__, 'ajax_sync' ] );
     }
@@ -44,15 +40,23 @@ class LOC_Product_Sync {
     /**
      * Pull all active products from Odoo and upsert into WooCommerce.
      *
-     * Uses offset pagination: many Odoo instances cap how many rows one search_read returns
-     * (often 80), so a single large limit is not enough. Filter: loc_odoo_product_pull_batch_size.
+     * Uses search() + read() with offset pagination (not search_read): some JSON-2 stacks
+     * return only one row per search_read; search+read is more reliable. Filters:
+     * loc_odoo_product_pull_batch_size, loc_odoo_product_pull_max_pages, loc_odoo_product_pull_order.
      */
     public static function pull_all(): void {
         if ( function_exists( 'set_time_limit' ) ) {
             @set_time_limit( 300 );
         }
 
-        $domain = [ [ 'active', '=', true ], [ 'sale_ok', '=', true ] ];
+        // Inventory > Products lists product.product (variants); we sync product.template (fewer rows). Filter to widen/narrow: loc_odoo_product_template_domain.
+        $domain = apply_filters(
+            'loc_odoo_product_template_domain',
+            [
+                [ 'active', '=', true ],
+                [ 'sale_ok', '=', true ],
+            ]
+        );
         // Ask up to this many rows per request; Odoo often caps lower (~80). Do NOT stop when count < limit — that was skipping all following pages.
         $batch = (int) apply_filters( 'loc_odoo_product_pull_batch_size', 80 );
         if ( $batch < 1 ) {
@@ -69,26 +73,36 @@ class LOC_Product_Sync {
         $page     = 0;
         $fetched  = 0;
 
+        $order = (string) apply_filters( 'loc_odoo_product_pull_order', 'id asc' );
+
         while ( $page < $max_pages ) {
             ++$page;
-            $records = LOC_API::search_read(
+            $ids = LOC_API::search(
                 'product.template',
                 $domain,
-                self::ODOO_FIELDS,
                 [
                     'limit'  => $batch,
                     'offset' => $offset,
+                    'order'  => $order,
                 ]
             );
 
-            if ( ! is_array( $records ) ) {
+            if ( ! is_array( $ids ) ) {
                 if ( $offset === 0 ) {
-                    LOC_API::log( 'product_pull', 0, 0, 'error', 'search_read failed or unexpected response shape' );
+                    LOC_API::log( 'product_pull', 0, 0, 'error', 'product.template search failed' );
                 }
                 break;
             }
 
-            if ( $records === [] ) {
+            if ( $ids === [] ) {
+                break;
+            }
+
+            $records = LOC_API::read( 'product.template', $ids, self::ODOO_FIELDS );
+            if ( ! is_array( $records ) ) {
+                if ( $offset === 0 ) {
+                    LOC_API::log( 'product_pull', 0, 0, 'error', 'product.template read failed after search' );
+                }
                 break;
             }
 
@@ -110,8 +124,8 @@ class LOC_Product_Sync {
                 ++$total;
             }
 
-            $fetched  = count( $records );
-            $offset  += $fetched;
+            $fetched = count( $ids );
+            $offset += $fetched;
         }
 
         $suffix = '';
@@ -123,6 +137,87 @@ class LOC_Product_Sync {
     }
 
     /**
+     * WooCommerce SKUs must be unique. Empty SKU allows unlimited duplicate products on each sync — always use a stable SKU.
+     * Odoo often has several product.template rows sharing the same Internal Reference (non-empty case).
+     */
+    private static function fallback_sku_for_template( int $odoo_template_id ): string {
+        return (string) apply_filters( 'loc_odoo_empty_internal_reference_sku', 'ODOO-T-' . $odoo_template_id, $odoo_template_id );
+    }
+
+    /**
+     * Remove duplicate-resolution suffixes (-T123) that we append when Internal Reference collides.
+     * If those strings were pushed back to Odoo default_code and re-imported, each sync would append again
+     * (snowball: AN 5960-T930-T1197-T…). Strip all trailing -T{digits} until stable.
+     *
+     * @param string $code Raw default_code from Odoo or WC SKU before collision logic.
+     */
+    private static function strip_duplicate_resolution_suffixes( string $code ): string {
+        $code = trim( $code );
+        if ( $code === '' ) {
+            return '';
+        }
+        $stripped = $code;
+        $prev     = '';
+        while ( $prev !== $stripped ) {
+            $prev     = $stripped;
+            $stripped = preg_replace( '/-T\d+$/', '', $stripped );
+        }
+        return trim( $stripped );
+    }
+
+    /**
+     * WooCommerce SKUs must be unique. Odoo often has several product.template rows sharing the same Internal Reference.
+     */
+    private static function resolve_pull_sku( string $default_code, int $odoo_template_id ): string {
+        $base = sanitize_text_field( $default_code );
+        if ( $base === '' ) {
+            return self::fallback_sku_for_template( $odoo_template_id );
+        }
+        if ( ! function_exists( 'wc_get_product_id_by_sku' ) ) {
+            return $base;
+        }
+        $pid = wc_get_product_id_by_sku( $base );
+        if ( ! $pid ) {
+            return $base;
+        }
+        $linked_odoo = (int) get_post_meta( $pid, '_loc_odoo_product_id', true );
+        if ( $linked_odoo === $odoo_template_id ) {
+            return $base;
+        }
+        $extra = (string) apply_filters( 'loc_odoo_duplicate_sku_suffix', '-T' . $odoo_template_id, $odoo_template_id, $base );
+        return $base . $extra;
+    }
+
+    /**
+     * Find existing WC product: meta first, then canonical SKU for templates without Internal Reference.
+     */
+    private static function find_wc_product_id_for_odoo_template( int $odoo_id ): int {
+        if ( $odoo_id < 1 ) {
+            return 0;
+        }
+        $ids = wc_get_products(
+            [
+                'meta_key'   => '_loc_odoo_product_id',
+                'meta_value' => $odoo_id,
+                'return'     => 'ids',
+                'limit'      => 1,
+                'status'     => 'any',
+            ]
+        );
+        if ( ! empty( $ids ) ) {
+            return (int) $ids[0];
+        }
+        if ( function_exists( 'wc_get_product_id_by_sku' ) ) {
+            $sku = self::fallback_sku_for_template( $odoo_id );
+            $pid = wc_get_product_id_by_sku( $sku );
+            if ( $pid ) {
+                return (int) $pid;
+            }
+        }
+        return 0;
+    }
+
+    /**
      * Create or update a WooCommerce product from an Odoo product.template record.
      *
      * @param array $rec Odoo product.template fields.
@@ -130,16 +225,12 @@ class LOC_Product_Sync {
     private static function upsert_wc_product( array $rec ): void {
         $odoo_id = (int) $rec['id'];
 
-        // Find existing WC product by odoo id meta
-        $existing_ids = wc_get_products( [
-            'meta_key'   => '_loc_odoo_product_id',
-            'meta_value' => $odoo_id,
-            'return'     => 'ids',
-            'limit'      => 1,
-        ] );
-
-        if ( ! empty( $existing_ids ) ) {
-            $product = wc_get_product( $existing_ids[0] );
+        $existing_wc_id = self::find_wc_product_id_for_odoo_template( $odoo_id );
+        if ( $existing_wc_id > 0 ) {
+            $product = wc_get_product( $existing_wc_id );
+            if ( ! $product ) {
+                $product = new WC_Product_Simple();
+            }
         } else {
             $product = new WC_Product_Simple();
         }
@@ -152,79 +243,44 @@ class LOC_Product_Sync {
             $product->set_description( wp_kses_post( $rec['description_sale'] ) );
         }
 
-        if ( ! empty( $rec['default_code'] ) ) {
-            $product->set_sku( sanitize_text_field( $rec['default_code'] ) );
-        }
+        $base_code = ! empty( $rec['default_code'] ) ? (string) $rec['default_code'] : '';
+        $base_code = self::strip_duplicate_resolution_suffixes( $base_code );
+        $sku       = self::resolve_pull_sku( $base_code, $odoo_id );
+        $product->set_sku( $sku );
 
         // Manage stock based on Odoo qty
         $product->set_manage_stock( true );
         $product->set_stock_quantity( (float) $rec['qty_available'] );
         $product->set_stock_status( $rec['qty_available'] > 0 ? 'instock' : 'outofstock' );
 
-        // Suppress re-push to Odoo while saving this product
-        remove_action( 'woocommerce_update_product', [ __CLASS__, 'push_product' ], 20 );
-
         $wc_id = 0;
         try {
             $wc_id = $product->save();
         } catch ( \Throwable $e ) {
             LOC_API::log( 'product_pull', 0, $odoo_id, 'error', 'WC save failed: ' . $e->getMessage() );
-        } finally {
-            add_action( 'woocommerce_update_product', [ __CLASS__, 'push_product' ], 20 );
         }
 
         if ( $wc_id ) {
             update_post_meta( $wc_id, '_loc_odoo_product_id',      $odoo_id );
             update_post_meta( $wc_id, '_loc_odoo_product_tmpl_id', $odoo_id );
             update_post_meta( $wc_id, '_loc_last_synced',          gmdate( 'Y-m-d H:i:s' ) );
-            LOC_API::log( 'product_pull', $wc_id, $odoo_id, 'ok', "Upserted '{$rec['name']}'" );
+            if ( apply_filters( 'loc_odoo_log_each_product_pull_success', false ) ) {
+                LOC_API::log( 'product_pull', $wc_id, $odoo_id, 'ok', "Upserted '{$rec['name']}'" );
+            }
         }
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Push: WooCommerce → Odoo
+    // Push disabled: WooCommerce must not write product.template to Odoo
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * Push a WooCommerce product save event to Odoo.
+     * Legacy hook target — intentionally no-op. Product data is Odoo → WP only.
      *
      * @param int $product_id WC product post id.
      */
     public static function push_product( int $product_id ): void {
-        $product = wc_get_product( $product_id );
-        if ( ! $product ) {
-            return;
-        }
-
-        $odoo_id = (int) get_post_meta( $product_id, '_loc_odoo_product_id', true );
-
-        $vals = [
-            'name'             => $product->get_name(),
-            'list_price'       => (float) $product->get_regular_price(),
-            'description_sale' => wp_strip_all_tags( $product->get_description() ),
-        ];
-
-        if ( $sku = $product->get_sku() ) {
-            $vals['default_code'] = $sku;
-        }
-
-        if ( $odoo_id > 0 ) {
-            // Update existing Odoo product
-            $ok = LOC_API::write( 'product.template', [ $odoo_id ], $vals );
-            LOC_API::log( 'product_push', $product_id, $odoo_id, $ok ? 'ok' : 'error', $ok ? 'Updated' : 'Write failed' );
-        } else {
-            // Create new Odoo product
-            $vals['type']    = 'consu';   // storable goods
-            $vals['sale_ok'] = true;
-            $new_id = LOC_API::create( 'product.template', $vals );
-            if ( $new_id ) {
-                update_post_meta( $product_id, '_loc_odoo_product_id',      $new_id );
-                update_post_meta( $product_id, '_loc_odoo_product_tmpl_id', $new_id );
-                LOC_API::log( 'product_push', $product_id, $new_id, 'ok', 'Created in Odoo' );
-            } else {
-                LOC_API::log( 'product_push', $product_id, 0, 'error', 'Create failed' );
-            }
-        }
+        // Intentionally empty — product master data is not written to Odoo.
     }
 
     // ════════════════════════════════════════════════════════════════════════
