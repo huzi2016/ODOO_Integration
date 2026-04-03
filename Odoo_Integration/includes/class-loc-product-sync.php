@@ -188,9 +188,15 @@ class LOC_Product_Sync {
      * Default: only one WC product per Internal Reference — extra templates are skipped (see filter
      * loc_odoo_skip_duplicate_internal_reference_templates). Legacy behaviour: append -T&lt;template_id&gt;.
      *
+     * When existing WC rows only have legacy SKUs like AN5648-T5702 (no bare AN5648), wc_get_product_id_by_sku(AN5648)
+     * is empty for every template — we still allow only one winner per pull using a static map (first template in
+     * processing order wins; use id asc pull order so the lowest Odoo id wins).
+     *
      * @return string|null SKU to use, or null when this template is skipped as a duplicate.
      */
     private static function resolve_pull_sku( string $default_code, int $odoo_template_id ): ?string {
+        static $canonical_owner_in_this_pull = [];
+
         $base = sanitize_text_field( $default_code );
         if ( $base === '' ) {
             return self::fallback_sku_for_template( $odoo_template_id );
@@ -198,8 +204,24 @@ class LOC_Product_Sync {
         if ( ! function_exists( 'wc_get_product_id_by_sku' ) ) {
             return $base;
         }
+
+        $skip_dup = apply_filters( 'loc_odoo_skip_duplicate_internal_reference_templates', true );
+
+        // Another template already reserved this canonical SKU earlier in this same pull (before any WC save).
+        if ( isset( $canonical_owner_in_this_pull[ $base ] )
+            && (int) $canonical_owner_in_this_pull[ $base ] !== $odoo_template_id ) {
+            if ( $skip_dup ) {
+                return null;
+            }
+            $extra = (string) apply_filters( 'loc_odoo_duplicate_sku_suffix', '-T' . $odoo_template_id, $odoo_template_id, $base );
+            return $base . $extra;
+        }
+
         $pid = wc_get_product_id_by_sku( $base );
         if ( ! $pid ) {
+            if ( ! isset( $canonical_owner_in_this_pull[ $base ] ) ) {
+                $canonical_owner_in_this_pull[ $base ] = $odoo_template_id;
+            }
             return $base;
         }
         $linked_odoo = (int) get_post_meta( $pid, '_loc_odoo_product_id', true );
@@ -207,9 +229,12 @@ class LOC_Product_Sync {
             return $base;
         }
         if ( $linked_odoo === 0 ) {
+            if ( ! isset( $canonical_owner_in_this_pull[ $base ] ) ) {
+                $canonical_owner_in_this_pull[ $base ] = $odoo_template_id;
+            }
             return $base;
         }
-        if ( apply_filters( 'loc_odoo_skip_duplicate_internal_reference_templates', true ) ) {
+        if ( $skip_dup ) {
             return null;
         }
         $extra = (string) apply_filters( 'loc_odoo_duplicate_sku_suffix', '-T' . $odoo_template_id, $odoo_template_id, $base );
@@ -246,6 +271,42 @@ class LOC_Product_Sync {
     }
 
     /**
+     * When a duplicate Odoo template is skipped, remove the obsolete WC row that still uses legacy SKU base-T{id}.
+     */
+    private static function maybe_trash_duplicate_wc_product_for_skipped_template( int $odoo_template_id, string $canonical_base ): void {
+        if ( ! apply_filters( 'loc_odoo_trash_skipped_duplicate_wc_products', true ) ) {
+            return;
+        }
+        if ( $canonical_base === '' ) {
+            return;
+        }
+        $ids = wc_get_products(
+            [
+                'meta_key'   => '_loc_odoo_product_id',
+                'meta_value' => $odoo_template_id,
+                'return'     => 'ids',
+                'limit'      => 1,
+                'status'     => 'any',
+            ]
+        );
+        if ( empty( $ids ) ) {
+            return;
+        }
+        $pid = (int) $ids[0];
+        $product = wc_get_product( $pid );
+        if ( ! $product ) {
+            return;
+        }
+        $current_sku = $product->get_sku();
+        $pattern     = '/^' . preg_quote( $canonical_base, '/' ) . '-T\d+$/';
+        if ( ! preg_match( $pattern, $current_sku ) ) {
+            return;
+        }
+        wp_trash_post( $pid );
+        LOC_API::log( 'product_pull', $pid, $odoo_template_id, 'ok', 'Trashed duplicate WC product (legacy -T SKU for same Internal Reference).' );
+    }
+
+    /**
      * Create or update a WooCommerce product from an Odoo product.template record.
      *
      * @param array $rec Odoo product.template fields.
@@ -261,6 +322,7 @@ class LOC_Product_Sync {
 
         $sku = self::resolve_pull_sku( $base_code, $odoo_id );
         if ( $sku === null ) {
+            self::maybe_trash_duplicate_wc_product_for_skipped_template( $odoo_id, $base_code );
             if ( apply_filters( 'loc_odoo_log_skipped_duplicate_templates', false ) ) {
                 LOC_API::log( 'product_pull', 0, $odoo_id, 'ok', 'Skipped duplicate Internal Reference (SKU already used by another Odoo template).' );
             }
