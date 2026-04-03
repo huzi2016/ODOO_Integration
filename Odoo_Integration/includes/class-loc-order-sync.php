@@ -134,6 +134,19 @@ class LOC_Order_Sync {
         $odoo_partner_id = 0;
         if ( $customer_id > 0 ) {
             $odoo_partner_id = (int) get_user_meta( $customer_id, '_loc_odoo_partner_id', true );
+
+            // Verify cached partner still exists in Odoo (may have been deleted/recreated).
+            if ( $odoo_partner_id > 0 ) {
+                $check = LOC_API::read( 'res.partner', [ $odoo_partner_id ], [ 'id' ] );
+                if ( empty( $check ) ) {
+                    LOC_API::log( 'order_push', $order_id, $odoo_partner_id, 'error',
+                        "Cached partner {$odoo_partner_id} no longer exists in Odoo — clearing cache and re-syncing." );
+                    delete_user_meta( $customer_id, '_loc_odoo_partner_id' );
+                    clean_user_cache( $customer_id );
+                    $odoo_partner_id = 0;
+                }
+            }
+
             if ( $odoo_partner_id <= 0 ) {
                 $odoo_partner_id = LOC_Customer_Sync::upsert_partner( $customer_id );
             }
