@@ -58,6 +58,17 @@ jQuery( function ( $ ) {
             .always( function () { $btn.prop( 'disabled', false ).text( '🧪 Test Odoo connection' ); } );
     } );
 
+    // Write test
+    $( '#loc-write-test-btn' ).on( 'click', function () {
+        var $btn    = $( this ).prop( 'disabled', true ).text( 'Testing write…' );
+        var $result = $( '#loc-write-test-result' );
+        $.post( locAdmin.ajax_url, { action: 'loc_test_write', nonce: locAdmin.nonce } )
+            .done( function ( res ) {
+                $result.css( 'color', res.success ? '#0a5' : '#c00' ).text( res.data );
+            } )
+            .always( function () { $btn.prop( 'disabled', false ).text( '✍️ Test Odoo write (safe — creates & immediately deletes a test note)' ); } );
+    } );
+
     // Manual sync buttons
     $( '.loc-sync-btn' ).on( 'click', function () {
         var $btn    = $( this ).prop( 'disabled', true ).text( 'Syncing…' );
@@ -68,6 +79,26 @@ jQuery( function ( $ ) {
                 $result.text( res.success ? '✅ ' + res.data : '❌ ' + res.data );
             } )
             .always( function () { $btn.prop( 'disabled', false ).text( 'Sync now' ); } );
+    } );
+
+    // Manual order push
+    $( '#loc-push-order-btn' ).on( 'click', function () {
+        var orderId = $( '#loc-order-id-input' ).val();
+        if ( ! orderId ) { alert( 'Please enter a WC Order ID.' ); return; }
+        var $btn    = $( this ).prop( 'disabled', true ).text( 'Pushing…' );
+        var $result = $( '#loc-push-order-result' );
+        $result.css( 'color', '#888' ).text( 'Sending to Odoo…' );
+        $.post( locAdmin.ajax_url, { action: 'loc_push_order', nonce: locAdmin.nonce, order_id: orderId } )
+            .done( function ( res ) {
+                if ( res.success ) {
+                    var sid = res.data && res.data.odoo_sale_id ? res.data.odoo_sale_id : '?';
+                    $result.css( 'color', '#0a5' ).text( '✅ Odoo sale.order created: SO#' + sid + ' — check the WC order notes for details.' );
+                } else {
+                    $result.css( 'color', '#c00' ).text( '❌ ' + ( res.data || 'Unknown error — check Sync Log tab.' ) );
+                }
+            } )
+            .fail( function () { $result.css( 'color', '#c00' ).text( '❌ AJAX request failed.' ); } )
+            .always( function () { $btn.prop( 'disabled', false ).text( '📦 Push order to Odoo' ); } );
     } );
 
     // Load log

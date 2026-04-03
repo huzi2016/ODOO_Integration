@@ -138,9 +138,9 @@ class LOC_Customer_Sync {
         $name  = trim( "$first $last" ) ?: $wp_user->display_name;
 
         $vals = [
-            'name'    => sanitize_text_field( $name ),
-            'email'   => sanitize_email( $wp_user->user_email ),
-            'company' => false,
+            'name'         => sanitize_text_field( $name ),
+            'email'        => sanitize_email( $wp_user->user_email ),
+            'company_type' => 'person',
         ];
 
         $phone = $wc_customer->get_billing_phone();

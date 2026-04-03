@@ -670,12 +670,25 @@ class LOC_Product_Sync {
             $by_sku = wc_get_product_id_by_sku( $sku );
             if ( $by_sku ) {
                 $linked = (int) get_post_meta( $by_sku, '_loc_odoo_product_id', true );
-                // Allow linkage when: unlinked, already this template, or an authoritative clean
-                // template reclaiming from a previously-linked polluted template.
-                if ( $linked === 0 || $linked === $odoo_id
+                // The SKU ends with -T{this_id}: this product was originally created for this template
+                // even if the meta somehow got corrupted or is missing.
+                $is_own_suffixed_sku = str_ends_with( $sku, '-T' . $odoo_id );
+                // Allow linkage when: unlinked, already this template, owns the suffixed SKU, or an
+                // authoritative clean template reclaiming from a previously-linked polluted template.
+                if ( $linked === 0 || $linked === $odoo_id || $is_own_suffixed_sku
                     || ( $is_authoritative && apply_filters( 'loc_odoo_clean_template_reclaims_sku', true ) ) ) {
                     $existing_wc_id = (int) $by_sku;
                 }
+            }
+        }
+
+        // Last-resort: if the SKU is already taken by ANY product and we still have no $existing_wc_id,
+        // update that product in-place rather than trying to create a new one (which would throw).
+        if ( $existing_wc_id <= 0 && $sku !== '' && function_exists( 'wc_get_product_id_by_sku' ) ) {
+            $fallback = wc_get_product_id_by_sku( $sku );
+            if ( $fallback ) {
+                $existing_wc_id = (int) $fallback;
+                LOC_API::log( 'product_pull', $fallback, $odoo_id, 'ok', "SKU '{$sku}' already taken — updating existing WC product #{$fallback} in-place." );
             }
         }
 
@@ -702,7 +715,26 @@ class LOC_Product_Sync {
             $product->set_description( wp_kses_post( $rec['description_sale'] ) );
         }
 
-        $product->set_sku( $sku );
+        try {
+            $product->set_sku( $sku );
+        } catch ( \Throwable $e ) {
+            // SKU collision: another WC product still holds this SKU. Find and update it in-place.
+            $collision_id = function_exists( 'wc_get_product_id_by_sku' ) ? (int) wc_get_product_id_by_sku( $sku ) : 0;
+            if ( $collision_id && $collision_id !== $product->get_id() ) {
+                LOC_API::log( 'product_pull', $collision_id, $odoo_id, 'ok', "SKU collision on '{$sku}' — switching to existing WC product #{$collision_id}." );
+                $product = wc_get_product( $collision_id ) ?: new WC_Product_Simple();
+                $product->set_name( sanitize_text_field( $rec['name'] ) );
+                $product->set_regular_price( $price_str );
+                $product->set_sale_price( '' );
+                if ( ! empty( $rec['description_sale'] ) ) {
+                    $product->set_description( wp_kses_post( $rec['description_sale'] ) );
+                }
+                // $product already owns this SKU — no need to set_sku again.
+            } else {
+                LOC_API::log( 'product_pull', 0, $odoo_id, 'error', "set_sku('{$sku}') failed: " . $e->getMessage() );
+                return 'error';
+            }
+        }
 
         // Manage stock based on Odoo qty
         $product->set_manage_stock( true );

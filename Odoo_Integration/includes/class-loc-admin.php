@@ -15,8 +15,9 @@ class LOC_Admin {
         add_action( 'admin_menu',            [ __CLASS__, 'add_menu' ] );
         add_action( 'admin_init',            [ __CLASS__, 'register_settings' ] );
         add_action( 'admin_enqueue_scripts', [ __CLASS__, 'enqueue' ] );
-        add_action( 'wp_ajax_loc_test_connection', [ __CLASS__, 'ajax_test_connection' ] );
-        add_action( 'wp_ajax_loc_view_log',        [ __CLASS__, 'ajax_view_log' ] );
+        add_action( 'wp_ajax_loc_test_connection',  [ __CLASS__, 'ajax_test_connection' ] );
+        add_action( 'wp_ajax_loc_test_write',       [ __CLASS__, 'ajax_test_write' ] );
+        add_action( 'wp_ajax_loc_view_log',         [ __CLASS__, 'ajax_view_log' ] );
     }
 
     public static function add_menu(): void {
@@ -166,6 +167,90 @@ class LOC_Admin {
         <hr>
         <button id="loc-test-btn" class="button button-secondary">🧪 Test Odoo connection</button>
         <span id="loc-test-result" style="margin-left:12px;font-weight:600;"></span>
+
+        <h3 style="margin-top:28px;">Plugin status</h3>
+        <?php
+        $writes_ok    = LOC_API::writes_allowed();
+        $catalog_ok   = ! LOC_API::catalog_model_write_forbidden( 'product.template' );
+        $secret_ok    = strlen( (string) get_option( 'loc_webhook_secret', '' ) ) >= 8;
+
+        $row = static function ( string $label, bool $ok, string $ok_text, string $fail_text, string $hint = '' ): void {
+            $color = $ok ? '#0a5' : '#c00';
+            $text  = $ok ? $ok_text : $fail_text;
+            printf(
+                '<tr><td style="padding:6px 12px 6px 0;font-weight:600">%s</td>'
+                . '<td style="color:%s;font-weight:700;padding:6px 12px">%s</td>'
+                . '<td style="color:#666;font-size:12px">%s</td></tr>',
+                esc_html( $label ),
+                esc_attr( $color ),
+                esc_html( $text ),
+                esc_html( $hint )
+            );
+        };
+        ?>
+        <table style="border-collapse:collapse;max-width:720px;margin-top:8px;">
+        <?php
+        $row(
+            'Odoo writes (orders / customers)',
+            $writes_ok,
+            '✅ Enabled',
+            '❌ Disabled — orders will NOT be created in Odoo',
+            $writes_ok
+                ? 'LOC_ODOO_WRITES_ALLOWED = true is set in wp-config.php'
+                : 'Add: define( \'LOC_ODOO_WRITES_ALLOWED\', true ); to wp-config.php'
+        );
+        $row(
+            'Product catalog writes',
+            $catalog_ok,
+            '✅ Enabled (unusual)',
+            '✅ Blocked (correct — Odoo is source of truth)',
+            'product.template / product.product are read-only from WP'
+        );
+        $row(
+            'Webhook secret',
+            $secret_ok,
+            '✅ Set',
+            '⚠️ Empty or too short — Odoo callbacks will be rejected',
+            'Set a strong secret in the field above and use it in Odoo Automated Actions'
+        );
+        $row(
+            'API mode',
+            true,
+            LOC_API::api_mode() === 'json2' ? '✅ JSON-2 (recommended)' : '⚠️ JSON-RPC (legacy)',
+            '',
+            LOC_API::api_mode() === 'json2'
+                ? 'POST /json/2/<model>/<method> + Bearer API key'
+                : 'POST /jsonrpc — use only for self-hosted Odoo 14–18'
+        );
+        $row(
+            'Odoo URL',
+            (bool) LOC_API::url(),
+            '✅ ' . LOC_API::url(),
+            '❌ Not set',
+            ''
+        );
+        ?>
+        </table>
+
+        <p style="margin-top:14px;">
+            <button id="loc-write-test-btn" class="button button-secondary"
+                <?php echo $writes_ok ? '' : 'disabled title="Enable writes first"'; ?>>
+                ✍️ Test Odoo write (safe — creates &amp; immediately deletes a test note)
+            </button>
+            <span id="loc-write-test-result" style="margin-left:12px;font-weight:600;"></span>
+        </p>
+
+        <?php if ( ! $writes_ok ) : ?>
+        <div class="notice notice-error" style="margin:16px 0;max-width:720px;">
+            <p><strong>Odoo writes are disabled.</strong>
+            WP → Odoo order and customer sync will silently fail until you add the following line to <code>wp-config.php</code>
+            (before the <code>/* That's all, stop editing! */</code> comment):</p>
+            <pre style="background:#f0f0f0;padding:10px;border-radius:4px;font-size:13px;">define( 'LOC_ODOO_WRITES_ALLOWED', true );</pre>
+            <p>After adding it, reload this page — the status row above will turn green and the write-test button will become clickable.</p>
+            <p>Product catalog writes (<code>product.template</code> / <code>product.product</code>) remain blocked regardless of this setting — Odoo stays the source of truth for the catalog.</p>
+        </div>
+        <?php endif; ?>
+
         </div>
 
         <!-- ══ Tab: Sync Controls ══════════════════════════════════════════ -->
@@ -230,6 +315,16 @@ class LOC_Admin {
             </tbody>
         </table>
         <p id="loc-sync-result" style="font-weight:600;color:#2271b1;margin-top:12px;"></p>
+
+        <h2 style="margin-top:32px;">Manual order push</h2>
+        <p style="max-width:720px">Re-push a WooCommerce order to Odoo. Enter the WC Order ID (number shown in <strong>WooCommerce → Orders</strong>).
+        Useful if an order was placed before writes were enabled, or if the hook failed.</p>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <input id="loc-order-id-input" type="number" min="1" placeholder="WC Order ID e.g. 1234"
+                   style="width:220px;" class="regular-text">
+            <button id="loc-push-order-btn" class="button button-primary">📦 Push order to Odoo</button>
+        </div>
+        <p id="loc-push-order-result" style="font-weight:600;margin-top:10px;max-width:720px;"></p>
 
         <h2 style="margin-top:32px;">Real-time event trigger from Odoo</h2>
         <p>Set up an <strong>Automated Action</strong> in Odoo so that WordPress is notified <em>immediately</em> whenever a product is saved — no manual clicks needed.</p>
@@ -403,6 +498,37 @@ for tmpl in records:
         } else {
             wp_send_json_error( '❌ Connection failed, please check URL / database / username / password.' );
         }
+    }
+
+    /**
+     * Create a throwaway res.partner note and immediately delete it to confirm Odoo writes work end-to-end.
+     */
+    public static function ajax_test_write(): void {
+        check_ajax_referer( 'loc_admin_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Permission denied.' );
+        }
+
+        if ( ! LOC_API::writes_allowed() ) {
+            wp_send_json_error( '❌ LOC_ODOO_WRITES_ALLOWED is not true — add it to wp-config.php and reload.' );
+        }
+
+        // Use res.partner for the write test — no special permissions required.
+        $test_name = '[LOC-write-test] ' . gmdate( 'Y-m-d H:i:s' );
+        $partner_id = LOC_API::create( 'res.partner', [
+            'name'         => $test_name,
+            'company_type' => 'person',
+            'active'       => false,   // archived immediately — won't pollute the partner list
+        ] );
+
+        if ( ! $partner_id ) {
+            wp_send_json_error( '❌ LOC_ODOO_WRITES_ALLOWED = true but the create call failed — check the sync log and Odoo credentials.' );
+        }
+
+        // Clean up: archive/delete the test partner
+        LOC_API::call( 'res.partner', 'unlink', [ [ $partner_id ] ] );
+
+        wp_send_json_success( "✅ Write test passed! Created res.partner #{$partner_id} and deleted it. Odoo writes are fully operational." );
     }
 
     public static function ajax_view_log(): void {
