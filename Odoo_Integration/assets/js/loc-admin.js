@@ -8,7 +8,44 @@ jQuery( function ( $ ) {
     }
     if ( locAdmin.product_url ) {
         $( '#loc-product-url' ).text( locAdmin.product_url );
+        $( '#loc-product-url2' ).text( locAdmin.product_url );
+
+        // Generate Odoo Automated Action Python code with the live endpoint and secret placeholder.
+        var code = [
+            'import requests',
+            '',
+            'WP_URL = \'' + locAdmin.product_url + '\'',
+            'WP_SECRET = \'' + ( locAdmin.webhook_secret || 'your_webhook_secret' ) + '\'',
+            '',
+            'for tmpl in records:',
+            '    try:',
+            '        r = requests.post(',
+            '            WP_URL,',
+            '            json={\'odoo_template_id\': tmpl.id},',
+            '            headers={\'X-Odoo-Secret\': WP_SECRET, \'Content-Type\': \'application/json\'},',
+            '            timeout=30,',
+            '        )',
+            '        # Optional: log result',
+            '        # raise_if 400+ so Odoo marks the action as failed for review',
+            '        if r.status_code >= 400:',
+            '            raise UserError(\'WP sync failed: %s\' % r.text[:200])',
+            '    except requests.exceptions.Timeout:',
+            '        pass  # non-blocking: WP will catch up on its 15-min schedule',
+        ].join('\n');
+
+        $( '#loc-odoo-action-code' ).text( code );
     }
+
+    // Copy Odoo action code to clipboard
+    $( '#loc-copy-action-code' ).on( 'click', function () {
+        var code = $( '#loc-odoo-action-code' ).text();
+        if ( navigator.clipboard ) {
+            navigator.clipboard.writeText( code ).then( function () {
+                $( '#loc-copy-action-code' ).text( '✅ Copied!' );
+                setTimeout( function () { $( '#loc-copy-action-code' ).text( '📋 Copy code' ); }, 2000 );
+            } );
+        }
+    } );
 
     // Connection test
     $( '#loc-test-btn' ).on( 'click', function () {

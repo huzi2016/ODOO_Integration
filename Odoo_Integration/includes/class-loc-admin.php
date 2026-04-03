@@ -66,11 +66,12 @@ class LOC_Admin {
             true
         );
         wp_localize_script( 'loc-admin-js', 'locAdmin', [
-            'ajax_url'      => admin_url( 'admin-ajax.php' ),
-            'nonce'         => wp_create_nonce( 'loc_admin_nonce' ),
-            'webhook_url'   => rest_url( 'loc/v1/odoo-callback' ),
-            'inv_url'       => rest_url( 'loc/v1/inventory-update' ),
-            'product_url'   => rest_url( 'loc/v1/product-sync' ),
+            'ajax_url'       => admin_url( 'admin-ajax.php' ),
+            'nonce'          => wp_create_nonce( 'loc_admin_nonce' ),
+            'webhook_url'    => rest_url( 'loc/v1/odoo-callback' ),
+            'inv_url'        => rest_url( 'loc/v1/inventory-update' ),
+            'product_url'    => rest_url( 'loc/v1/product-sync' ),
+            'webhook_secret' => get_option( 'loc_webhook_secret', '' ),
         ] );
     }
 
@@ -169,29 +170,91 @@ class LOC_Admin {
 
         <!-- ══ Tab: Sync Controls ══════════════════════════════════════════ -->
         <div id="tab-sync" class="loc-tab-content" style="display:none">
-        <h2>Manually trigger sync</h2>
-        <table class="wp-list-table widefat fixed striped" style="max-width:680px">
+
+        <h2>Automatic schedule</h2>
+        <table class="wp-list-table widefat fixed striped" style="max-width:720px">
+            <thead><tr><th>Task</th><th>Interval</th><th>Next run (server time)</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td><strong>⚡ Delta product pull</strong> — only templates modified in Odoo in the last 6 min</td>
+                    <td>Every 5 min</td>
+                    <td><?php
+                        $t = wp_next_scheduled( 'loc_sync_products_delta' );
+                        echo $t ? esc_html( get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $t ), 'Y-m-d H:i:s' ) ) : '<em style="color:#c00">not scheduled — re-activate plugin</em>';
+                    ?></td>
+                </tr>
+                <tr>
+                    <td><strong>Full product pull</strong> (name, price, SKU, stock — all active templates)</td>
+                    <td>Every 15 min</td>
+                    <td><?php
+                        $t = wp_next_scheduled( 'loc_sync_products_from_odoo' );
+                        echo $t ? esc_html( get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $t ), 'Y-m-d H:i:s' ) ) : '<em>not scheduled</em>';
+                    ?></td>
+                </tr>
+                <tr>
+                    <td><strong>Inventory sync</strong> (stock quantity only)</td>
+                    <td>Every 15 min</td>
+                    <td><?php
+                        $t = wp_next_scheduled( 'loc_sync_inventory' );
+                        echo $t ? esc_html( get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $t ), 'Y-m-d H:i:s' ) ) : '<em>not scheduled</em>';
+                    ?></td>
+                </tr>
+            </tbody>
+        </table>
+        <div class="notice notice-info" style="margin:16px 0 0;max-width:720px;">
+            <p><strong>WP-Cron fires only when someone visits the site.</strong> On low-traffic or staging sites the 15-minute jobs may be delayed.
+            Add a real server cron so the schedule is always respected:<br>
+            <code style="display:inline-block;margin:6px 0;padding:4px 8px;background:#f0f0f0;">*/15 * * * * curl -s "<?php echo esc_url( site_url( '/wp-cron.php?doing_wp_cron' ) ); ?>" &gt; /dev/null 2&gt;&amp;1</code><br>
+            (Run <code>crontab -e</code> on the server and paste the line above.)</p>
+        </div>
+
+        <h2 style="margin-top:32px;">Manual trigger</h2>
+        <table class="wp-list-table widefat fixed striped" style="max-width:720px">
             <thead><tr><th>Sync task</th><th>Description</th><th>Action</th></tr></thead>
             <tbody>
                 <tr>
-                    <td><strong>Product pull</strong></td>
-                    <td>Pull name, price, SKU, and per-variant stock sums from Odoo → WooCommerce. Afterward, runs a full inventory pass for all linked products (same as the row below).</td>
+                    <td><strong>⚡ Delta product sync</strong></td>
+                    <td>Only pulls templates with <code>write_date</code> in the last 6 minutes — very fast, near real-time.</td>
+                    <td><button class="button button-primary loc-sync-btn" data-action="loc_sync_products_delta">Sync now</button></td>
+                </tr>
+                <tr>
+                    <td><strong>Full product pull</strong></td>
+                    <td>Pull all active templates from Odoo → WooCommerce. Then runs a full inventory pass.</td>
                     <td><button class="button loc-sync-btn" data-action="loc_sync_products">Sync now</button></td>
                 </tr>
                 <tr>
                     <td><strong>Inventory sync</strong></td>
-                    <td>Updates stock only for every WC product that has <code>_loc_odoo_product_id</code>. Runs every 15 minutes via WP-Cron if the site receives traffic (or use a real cron hitting <code>wp-cron.php</code>).</td>
+                    <td>Updates stock quantity only for every WC product linked to an Odoo template.</td>
                     <td><button class="button loc-sync-btn" data-action="loc_sync_inventory">Sync now</button></td>
                 </tr>
             </tbody>
         </table>
         <p id="loc-sync-result" style="font-weight:600;color:#2271b1;margin-top:12px;"></p>
 
-        <h2 style="margin-top:32px;">Webhook endpoints (configure to Odoo)</h2>
-        <table class="form-table" style="max-width:680px">
+        <h2 style="margin-top:32px;">Real-time event trigger from Odoo</h2>
+        <p>Set up an <strong>Automated Action</strong> in Odoo so that WordPress is notified <em>immediately</em> whenever a product is saved — no manual clicks needed.</p>
+        <ol style="max-width:720px;line-height:1.9;">
+            <li>In Odoo go to <strong>Settings → Technical → Automated Actions</strong>.</li>
+            <li>Click <strong>New</strong>. Fill in:
+                <ul>
+                    <li><strong>Name</strong>: <code>Notify WordPress on product change</code></li>
+                    <li><strong>Model</strong>: <code>Product Template</code> (<code>product.template</code>)</li>
+                    <li><strong>Trigger</strong>: <em>2. Based on stage (Records saved)</em> — fires each time a template is saved</li>
+                    <li><strong>Before Update Filter</strong>: leave empty (fire for all saves)</li>
+                    <li><strong>Action</strong>: <em>Execute Python Code</em></li>
+                </ul>
+            </li>
+            <li>Paste the code below into the <strong>Python Code</strong> field, then click <strong>Save</strong> and <strong>Run</strong> once to test.</li>
+        </ol>
+        <p style="max-width:720px"><strong>Product sync endpoint:</strong> <code id="loc-product-url"></code></p>
+        <pre id="loc-odoo-action-code" style="background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;font-size:12px;line-height:1.6;max-width:720px;overflow-x:auto;white-space:pre-wrap;"></pre>
+        <button id="loc-copy-action-code" class="button" style="margin-top:6px;">📋 Copy code</button>
+
+        <h2 style="margin-top:32px;">Webhook endpoints</h2>
+        <table class="form-table" style="max-width:720px">
             <tr><th>Delivery completed callback</th><td><code id="loc-webhook-url"></code></td></tr>
             <tr><th>Inventory change push</th><td><code id="loc-inv-url"></code></td></tr>
-            <tr><th>Product sync (event)</th><td><code id="loc-product-url"></code></td></tr>
+            <tr><th>Product sync (event)</th><td><code id="loc-product-url2"></code></td></tr>
         </table>
         </div>
 
@@ -308,7 +371,8 @@ for tmpl in records:
             <tbody>
                 <tr><td>User registration / update address</td><td>WP → Odoo</td><td>Sync to res.partner, with membership number</td></tr>
                 <tr><td>Product save</td><td>—</td><td>No product push to Odoo (Odoo is source of truth for catalog)</td></tr>
-                <tr><td>Scheduled pull (hourly)</td><td>Odoo → WP</td><td>Sync product info & price</td></tr>
+                <tr><td>Delta pull (every 5 minutes)</td><td>Odoo → WP</td><td>Sync only recently-modified products (write_date filter)</td></tr>
+                <tr><td>Full pull (every 15 minutes)</td><td>Odoo → WP</td><td>Sync all active products — name, price, SKU, stock</td></tr>
                 <tr><td>Odoo <code>product.template</code> saved (optional)</td><td>Odoo → WP</td><td>POST <code>/wp-json/loc/v1/product-sync</code> with webhook secret</td></tr>
                 <tr><td>Scheduled pull (every 15 minutes)</td><td>Odoo → WP</td><td>Sync inventory quantity</td></tr>
                 <tr><td>Customer checkout (processing)</td><td>WP → Odoo</td><td>Create sale.order and confirm</td></tr>

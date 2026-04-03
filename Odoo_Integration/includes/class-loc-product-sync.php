@@ -24,14 +24,41 @@ class LOC_Product_Sync {
     const ODOO_FIELDS = [ 'id', 'name', 'description_sale', 'list_price', 'active', 'default_code' ];
 
     public static function init(): void {
-        // ── Scheduled pull (Odoo → WP) ──────────────────────────────────────
+        // ── Register cron intervals ──────────────────────────────────────────
+        add_filter( 'cron_schedules', static function ( array $s ): array {
+            if ( ! isset( $s['loc_every_15_min'] ) ) {
+                $s['loc_every_15_min'] = [ 'interval' => 900, 'display' => 'Every 15 Minutes' ];
+            }
+            if ( ! isset( $s['loc_every_5_min'] ) ) {
+                $s['loc_every_5_min'] = [ 'interval' => 300, 'display' => 'Every 5 Minutes' ];
+            }
+            return $s;
+        } );
+
+        // ── Full pull every 15 min (all active templates) ───────────────────
         add_action( 'loc_sync_products_from_odoo', [ __CLASS__, 'pull_all' ] );
-        if ( ! wp_next_scheduled( 'loc_sync_products_from_odoo' ) ) {
-            wp_schedule_event( time(), 'hourly', 'loc_sync_products_from_odoo' );
+        $next = wp_next_scheduled( 'loc_sync_products_from_odoo' );
+        if ( $next && wp_get_schedule( 'loc_sync_products_from_odoo' ) !== 'loc_every_15_min' ) {
+            wp_unschedule_event( $next, 'loc_sync_products_from_odoo' );
+            $next = false;
+        }
+        if ( ! $next ) {
+            wp_schedule_event( time(), 'loc_every_15_min', 'loc_sync_products_from_odoo' );
+        }
+
+        // ── Delta pull every 5 min (only Odoo templates modified recently) ──
+        // No Odoo-side configuration required: WordPress asks Odoo "what changed
+        // in the last 6 minutes?" using the write_date field. This gives near-
+        // real-time (<5 min) product updates without needing Odoo custom modules
+        // or scheduled actions that call external URLs (which Odoo safe_eval blocks).
+        add_action( 'loc_sync_products_delta', [ __CLASS__, 'pull_recent' ] );
+        if ( ! wp_next_scheduled( 'loc_sync_products_delta' ) ) {
+            wp_schedule_event( time() + 60, 'loc_every_5_min', 'loc_sync_products_delta' );
         }
 
         // ── Manual trigger via admin AJAX ───────────────────────────────────
-        add_action( 'wp_ajax_loc_sync_products', [ __CLASS__, 'ajax_sync' ] );
+        add_action( 'wp_ajax_loc_sync_products',       [ __CLASS__, 'ajax_sync' ] );
+        add_action( 'wp_ajax_loc_sync_products_delta', [ __CLASS__, 'ajax_sync_delta' ] );
 
         // ── Odoo → WP event hook (Automated Action / external HTTP) ─────────
         add_action( 'rest_api_init', [ __CLASS__, 'register_rest_route' ] );
@@ -53,12 +80,18 @@ class LOC_Product_Sync {
             @set_time_limit( 300 );
         }
 
-        // Inventory > Products lists product.product (variants); we sync product.template (fewer rows). Filter to widen/narrow: loc_odoo_product_template_domain.
+        // Exclude templates whose default_code is a snowball chain (e.g. AN5648-T613-T985-…).
+        // These are legacy duplicates from old two-way sync; they will never be the canonical source.
+        // The '|' operator applies to the two conditions that follow it: (default_code is NULL OR no double -T).
+        // To include them anyway, override the whole domain via filter loc_odoo_product_template_domain.
         $domain = apply_filters(
             'loc_odoo_product_template_domain',
             [
                 [ 'active', '=', true ],
                 [ 'sale_ok', '=', true ],
+                '|',
+                [ 'default_code', '=', false ],
+                [ 'default_code', 'not like', '%-T%-T%' ],
             ]
         );
         // Ask up to this many rows per request; Odoo often caps lower (~80). Do NOT stop when count < limit — that was skipping all following pages.
@@ -147,6 +180,78 @@ class LOC_Product_Sync {
 
         if ( apply_filters( 'loc_odoo_pull_inventory_after_product_pull', true ) && class_exists( 'LOC_Inventory_Sync' ) ) {
             LOC_Inventory_Sync::pull_inventory();
+        }
+    }
+
+    /**
+     * Delta pull: fetch only product.template rows that Odoo has modified within the last N minutes.
+     *
+     * Runs every 5 minutes. Because it uses write_date as a filter, it typically returns
+     * only a handful of records per pass — very fast. No Odoo-side configuration needed:
+     * Odoo's JSON-2 API exposes write_date on every model. This is the recommended replacement
+     * for trying to call external URLs from Odoo Scheduled Actions (which safe_eval blocks).
+     *
+     * Window: loc_odoo_delta_pull_minutes (default 6 — slightly wider than the 5-min schedule
+     * to handle clock drift / execution delay).
+     */
+    public static function pull_recent(): void {
+        $minutes = (int) apply_filters( 'loc_odoo_delta_pull_minutes', 6 );
+        if ( $minutes < 1 ) {
+            $minutes = 6;
+        }
+        $cutoff = gmdate( 'Y-m-d H:i:s', time() - $minutes * 60 );
+
+        $base_domain = apply_filters(
+            'loc_odoo_product_template_domain',
+            [
+                [ 'active', '=', true ],
+                [ 'sale_ok', '=', true ],
+                '|',
+                [ 'default_code', '=', false ],
+                [ 'default_code', 'not like', '%-T%-T%' ],
+            ]
+        );
+        // Append write_date constraint so we only fetch recently-changed templates.
+        $domain = array_merge( (array) $base_domain, [ [ 'write_date', '>=', $cutoff ] ] );
+
+        $batch = (int) apply_filters( 'loc_odoo_product_pull_batch_size', 80 );
+        if ( $batch < 1 ) {
+            $batch = 80;
+        }
+        $order = (string) apply_filters( 'loc_odoo_product_pull_order', 'id asc' );
+
+        $ids = LOC_API::search( 'product.template', $domain, [ 'limit' => 500, 'order' => $order ] );
+        if ( ! is_array( $ids ) || $ids === [] ) {
+            return; // nothing changed — skip silently (no log to keep log table clean)
+        }
+
+        $records = LOC_API::read( 'product.template', $ids, self::ODOO_FIELDS );
+        if ( ! is_array( $records ) || $records === [] ) {
+            return;
+        }
+
+        $found_ids   = array_column( $records, 'id' );
+        $qty_by_tmpl = LOC_API::sum_qty_available_by_template_ids( $found_ids );
+
+        $total   = 0;
+        $skipped = 0;
+        foreach ( $records as $rec ) {
+            if ( ! is_array( $rec ) || ! isset( $rec['id'] ) ) {
+                continue;
+            }
+            $tid                  = (int) $rec['id'];
+            $rec['qty_available'] = $qty_by_tmpl[ $tid ] ?? 0.0;
+            $out                  = self::upsert_wc_product( $rec );
+            if ( $out === 'skipped' ) {
+                ++$skipped;
+            } elseif ( $out === 'saved' ) {
+                ++$total;
+            }
+        }
+
+        if ( $total > 0 || $skipped > 0 ) {
+            $skip_msg = $skipped > 0 ? " {$skipped} duplicate(s) skipped." : '';
+            LOC_API::log( 'product_pull', 0, 0, 'ok', "Delta pull (last {$minutes} min): {$total} product(s) saved.{$skip_msg}" );
         }
     }
 
@@ -408,9 +513,12 @@ class LOC_Product_Sync {
      * is empty for every template — we still allow only one winner per pull using a static map (first template in
      * processing order wins; use id asc pull order so the lowest Odoo id wins).
      *
+     * @param bool $is_authoritative True when the incoming template's own default_code was already clean
+     *                               (no -T\d+ before stripping). A clean template may reclaim a WC product
+     *                               that was previously linked to a polluted/duplicate template.
      * @return string|null SKU to use, or null when this template is skipped as a duplicate.
      */
-    private static function resolve_pull_sku( string $default_code, int $odoo_template_id ): ?string {
+    private static function resolve_pull_sku( string $default_code, int $odoo_template_id, bool $is_authoritative = false ): ?string {
         static $canonical_owner_in_this_pull = [];
 
         $base = sanitize_text_field( $default_code );
@@ -441,13 +549,18 @@ class LOC_Product_Sync {
             return $base;
         }
         $linked_odoo = (int) get_post_meta( $pid, '_loc_odoo_product_id', true );
-        if ( $linked_odoo === $odoo_template_id ) {
-            return $base;
-        }
-        if ( $linked_odoo === 0 ) {
+        if ( $linked_odoo === $odoo_template_id || $linked_odoo === 0 ) {
             if ( ! isset( $canonical_owner_in_this_pull[ $base ] ) ) {
                 $canonical_owner_in_this_pull[ $base ] = $odoo_template_id;
             }
+            return $base;
+        }
+        // A "clean" template (no legacy -T suffix in its own default_code) is authoritative and may
+        // reclaim the WC product even if it is currently linked to a different (polluted) template.
+        // After upsert_wc_product saves, _loc_odoo_product_id is updated to this clean template id,
+        // so inventory and price will be read from the correct source from this point on.
+        if ( $is_authoritative && apply_filters( 'loc_odoo_clean_template_reclaims_sku', true ) ) {
+            $canonical_owner_in_this_pull[ $base ] = $odoo_template_id;
             return $base;
         }
         if ( $skip_dup ) {
@@ -531,12 +644,18 @@ class LOC_Product_Sync {
     private static function upsert_wc_product( array $rec ): string {
         $odoo_id = (int) $rec['id'];
 
+        // Detect a "clean" default_code — one that contains no -T\d+ segment before any stripping.
+        // Clean templates are the authoritative source and may reclaim WC products currently linked
+        // to polluted/duplicate templates (i.e. fix the wrong Odoo template → WC product mapping).
+        $raw_default_code = ! empty( $rec['default_code'] ) ? trim( (string) $rec['default_code'], " \t\n\r\0\x0B[]" ) : '';
+        $is_authoritative = ( $raw_default_code !== '' && ! preg_match( '/-T\d+/', $raw_default_code ) );
+
         $base_code = ! empty( $rec['default_code'] ) ? (string) $rec['default_code'] : '';
         $base_code = self::strip_duplicate_resolution_suffixes( $base_code );
         $base_code = self::normalize_internal_reference( $base_code );
         $base_code = (string) apply_filters( 'loc_odoo_normalize_internal_reference', $base_code, $rec );
 
-        $sku = self::resolve_pull_sku( $base_code, $odoo_id );
+        $sku = self::resolve_pull_sku( $base_code, $odoo_id, $is_authoritative );
         if ( $sku === null ) {
             self::maybe_trash_duplicate_wc_product_for_skipped_template( $odoo_id, $base_code );
             if ( apply_filters( 'loc_odoo_log_skipped_duplicate_templates', false ) ) {
@@ -550,7 +669,10 @@ class LOC_Product_Sync {
             $by_sku = wc_get_product_id_by_sku( $sku );
             if ( $by_sku ) {
                 $linked = (int) get_post_meta( $by_sku, '_loc_odoo_product_id', true );
-                if ( $linked === 0 || $linked === $odoo_id ) {
+                // Allow linkage when: unlinked, already this template, or an authoritative clean
+                // template reclaiming from a previously-linked polluted template.
+                if ( $linked === 0 || $linked === $odoo_id
+                    || ( $is_authoritative && apply_filters( 'loc_odoo_clean_template_reclaims_sku', true ) ) ) {
                     $existing_wc_id = (int) $by_sku;
                 }
             }
@@ -567,7 +689,13 @@ class LOC_Product_Sync {
 
         // Map Odoo fields → WC
         $product->set_name( sanitize_text_field( $rec['name'] ) );
-        $product->set_regular_price( (string) $rec['list_price'] );
+
+        // Format price exactly as WooCommerce expects: decimal string, dot separator, no thousands sep.
+        // wc_format_decimal() respects the store's decimals setting and normalises float quirks.
+        $raw_price  = is_numeric( $rec['list_price'] ?? '' ) ? (float) $rec['list_price'] : 0.0;
+        $price_str  = function_exists( 'wc_format_decimal' ) ? wc_format_decimal( $raw_price ) : (string) $raw_price;
+        $product->set_regular_price( $price_str );
+        $product->set_sale_price( '' ); // always clear WC sale price — Odoo is the price authority
 
         if ( ! empty( $rec['description_sale'] ) ) {
             $product->set_description( wp_kses_post( $rec['description_sale'] ) );
@@ -589,10 +717,13 @@ class LOC_Product_Sync {
         }
 
         if ( $wc_id ) {
+            $prev_linked = (int) get_post_meta( $wc_id, '_loc_odoo_product_id', true );
             update_post_meta( $wc_id, '_loc_odoo_product_id',      $odoo_id );
             update_post_meta( $wc_id, '_loc_odoo_product_tmpl_id', $odoo_id );
             update_post_meta( $wc_id, '_loc_last_synced',          gmdate( 'Y-m-d H:i:s' ) );
-            if ( apply_filters( 'loc_odoo_log_each_product_pull_success', false ) ) {
+            if ( $prev_linked > 0 && $prev_linked !== $odoo_id ) {
+                LOC_API::log( 'product_pull', $wc_id, $odoo_id, 'ok', "Reclaimed WC product from polluted template {$prev_linked} → clean template {$odoo_id} ('{$rec['name']}')." );
+            } elseif ( apply_filters( 'loc_odoo_log_each_product_pull_success', false ) ) {
                 LOC_API::log( 'product_pull', $wc_id, $odoo_id, 'ok', "Upserted '{$rec['name']}'" );
             }
             return 'saved';
@@ -625,5 +756,14 @@ class LOC_Product_Sync {
         }
         self::pull_all();
         wp_send_json_success( 'Product sync complete.' );
+    }
+
+    public static function ajax_sync_delta(): void {
+        check_ajax_referer( 'loc_admin_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Permission denied.' );
+        }
+        self::pull_recent();
+        wp_send_json_success( 'Delta sync complete (products modified in last 6 min).' );
     }
 }

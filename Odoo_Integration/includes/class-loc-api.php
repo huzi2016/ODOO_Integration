@@ -257,7 +257,6 @@ class LOC_API {
         if ( $chunk < 1 ) {
             $chunk = 80;
         }
-
         $read_chunk = (int) apply_filters( 'loc_odoo_variant_read_chunk', 200 );
         if ( $read_chunk < 1 ) {
             $read_chunk = 200;
@@ -271,12 +270,16 @@ class LOC_API {
                 [ 'limit' => 10000, 'order' => 'id asc' ]
             );
             if ( ! is_array( $pids ) || $pids === [] ) {
+                self::log( 'inventory_pull', 0, 0, 'error', 'product.product search returned empty for template ids: ' . implode( ',', $slice ) );
                 continue;
             }
+
+            // ── Primary: product.product qty_available / free_qty ─────────────
             $read_fields = apply_filters(
                 'loc_odoo_variant_stock_read_fields',
                 [ 'product_tmpl_id', 'qty_available', 'free_qty' ]
             );
+            $primary_filled = false;
 
             for ( $j = 0, $pn = count( $pids ); $j < $pn; $j += $read_chunk ) {
                 $id_chunk = array_slice( $pids, $j, $read_chunk );
@@ -290,13 +293,106 @@ class LOC_API {
                     }
                     $tid = self::many2one_to_int( $v['product_tmpl_id'] ?? null );
                     if ( $tid > 0 && array_key_exists( $tid, $sums ) ) {
-                        $sums[ $tid ] += self::variant_qty_from_odoo_row( $v );
+                        $qty = self::variant_qty_from_odoo_row( $v );
+                        $sums[ $tid ] += $qty;
+                        if ( $qty > 0 ) {
+                            $primary_filled = true;
+                        }
+                    }
+                }
+            }
+
+            // ── Fallback: stock.quant when product.product returns all zeros ───
+            // Odoo 17+ Online sometimes returns qty_available=0 via JSON-2
+            // without a warehouse/location context; stock.quant is the source of truth.
+            $all_zero = true;
+            foreach ( $slice as $tid ) {
+                if ( ( $sums[ $tid ] ?? 0.0 ) > 0 ) {
+                    $all_zero = false;
+                    break;
+                }
+            }
+
+            if ( $all_zero && apply_filters( 'loc_odoo_fallback_to_stock_quant', true ) ) {
+                $quant_sums = self::sum_qty_from_stock_quant( $pids, $sums, $read_chunk );
+                foreach ( $quant_sums as $tid => $qty ) {
+                    if ( $qty > 0 ) {
+                        $sums[ $tid ] = $qty;
                     }
                 }
             }
         }
 
         return $sums;
+    }
+
+    /**
+     * Read on-hand quantities from stock.quant (internal locations) for given product.product ids.
+     * Used as fallback when product.product.qty_available returns 0 without a location context.
+     *
+     * @param int[]              $variant_ids   product.product ids to query.
+     * @param array<int,float>   $tmpl_sums     Template id → current sum (used to resolve variant → template).
+     * @param int                $read_chunk    Ids per read() call.
+     * @return array<int,float>  template_id => qty_on_hand summed from stock.quant.
+     */
+    private static function sum_qty_from_stock_quant( array $variant_ids, array $tmpl_sums, int $read_chunk ): array {
+        $template_ids = array_keys( $tmpl_sums );
+        $result       = array_fill_keys( $template_ids, 0.0 );
+
+        // Build variant → template map
+        $variant_to_tmpl = [];
+        for ( $j = 0, $pn = count( $variant_ids ); $j < $pn; $j += $read_chunk ) {
+            $chunk_ids = array_slice( $variant_ids, $j, $read_chunk );
+            $rows      = self::read( 'product.product', $chunk_ids, [ 'product_tmpl_id' ] );
+            if ( ! is_array( $rows ) ) {
+                continue;
+            }
+            foreach ( $rows as $r ) {
+                if ( ! is_array( $r ) || ! isset( $r['id'] ) ) {
+                    continue;
+                }
+                $tid = self::many2one_to_int( $r['product_tmpl_id'] ?? null );
+                if ( $tid > 0 ) {
+                    $variant_to_tmpl[ (int) $r['id'] ] = $tid;
+                }
+            }
+        }
+
+        // Read stock.quant records for these variants in internal locations
+        $quants = self::search_read(
+            'stock.quant',
+            [
+                [ 'product_id', 'in', $variant_ids ],
+                [ 'location_id.usage', '=', 'internal' ],
+            ],
+            [ 'product_id', 'quantity', 'reserved_quantity' ],
+            [ 'limit' => 100000 ]
+        );
+        if ( ! is_array( $quants ) ) {
+            self::log( 'inventory_pull', 0, 0, 'error', 'stock.quant fallback read failed.' );
+            return $result;
+        }
+
+        foreach ( $quants as $q ) {
+            if ( ! is_array( $q ) ) {
+                continue;
+            }
+            $vid  = self::many2one_to_int( $q['product_id'] ?? null );
+            $tid  = $variant_to_tmpl[ $vid ] ?? 0;
+            if ( $tid <= 0 || ! array_key_exists( $tid, $result ) ) {
+                continue;
+            }
+            $qty = max( 0.0, (float) ( $q['quantity'] ?? 0 ) - (float) ( $q['reserved_quantity'] ?? 0 ) );
+            $result[ $tid ] += $qty;
+        }
+
+        if ( apply_filters( 'loc_odoo_debug_log_all_requests', false ) ) {
+            foreach ( $result as $tid => $qty ) {
+                self::log( 'inventory_pull', 0, $tid, 'ok', "stock.quant fallback qty={$qty}" );
+            }
+        }
+
+        return $result;
     }
 
     /**
