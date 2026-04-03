@@ -6,6 +6,9 @@ jQuery( function ( $ ) {
         $( '#loc-webhook-url' ).text( locAdmin.webhook_url );
         $( '#loc-inv-url' ).text( locAdmin.inv_url );
     }
+    if ( locAdmin.product_url ) {
+        $( '#loc-product-url' ).text( locAdmin.product_url );
+    }
 
     // Connection test
     $( '#loc-test-btn' ).on( 'click', function () {

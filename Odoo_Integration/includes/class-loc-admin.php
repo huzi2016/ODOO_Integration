@@ -66,10 +66,11 @@ class LOC_Admin {
             true
         );
         wp_localize_script( 'loc-admin-js', 'locAdmin', [
-            'ajax_url'   => admin_url( 'admin-ajax.php' ),
-            'nonce'      => wp_create_nonce( 'loc_admin_nonce' ),
-            'webhook_url' => rest_url( 'loc/v1/odoo-callback' ),
-            'inv_url'    => rest_url( 'loc/v1/inventory-update' ),
+            'ajax_url'      => admin_url( 'admin-ajax.php' ),
+            'nonce'         => wp_create_nonce( 'loc_admin_nonce' ),
+            'webhook_url'   => rest_url( 'loc/v1/odoo-callback' ),
+            'inv_url'       => rest_url( 'loc/v1/inventory-update' ),
+            'product_url'   => rest_url( 'loc/v1/product-sync' ),
         ] );
     }
 
@@ -84,6 +85,12 @@ class LOC_Admin {
         ?>
         <div class="wrap">
         <h1>🔗 Odoo Connector — LIMO Membership</h1>
+
+        <?php if ( ! LOC_API::writes_allowed() ) : ?>
+        <div class="notice notice-warning">
+            <p><strong>Odoo writes disabled (default):</strong> WordPress does not run <code>create</code>, <code>write</code>, or workflow <code>call</code> on Odoo. Product pull uses only <code>search</code>/<code>read</code> — it never updates Odoo Internal Reference. To push orders/customers, set <code>define( 'LOC_ODOO_WRITES_ALLOWED', true );</code> in <code>wp-config.php</code>. Product master data (<code>product.template</code> / <code>product.product</code>) stays blocked unless you add <code>add_filter( 'loc_odoo_allow_product_catalog_write', '__return_true' );</code>.</p>
+        </div>
+        <?php endif; ?>
 
         <?php settings_errors( 'loc_settings_group' ); ?>
 
@@ -168,12 +175,12 @@ class LOC_Admin {
             <tbody>
                 <tr>
                     <td><strong>Product pull</strong></td>
-                    <td>Pull product information + price from Odoo → WooCommerce</td>
+                    <td>Pull name, price, SKU, and per-variant stock sums from Odoo → WooCommerce. Afterward, runs a full inventory pass for all linked products (same as the row below).</td>
                     <td><button class="button loc-sync-btn" data-action="loc_sync_products">Sync now</button></td>
                 </tr>
                 <tr>
                     <td><strong>Inventory sync</strong></td>
-                    <td>Pull real-time inventory from Odoo → WooCommerce</td>
+                    <td>Updates stock only for every WC product that has <code>_loc_odoo_product_id</code>. Runs every 15 minutes via WP-Cron if the site receives traffic (or use a real cron hitting <code>wp-cron.php</code>).</td>
                     <td><button class="button loc-sync-btn" data-action="loc_sync_inventory">Sync now</button></td>
                 </tr>
             </tbody>
@@ -184,6 +191,7 @@ class LOC_Admin {
         <table class="form-table" style="max-width:680px">
             <tr><th>Delivery completed callback</th><td><code id="loc-webhook-url"></code></td></tr>
             <tr><th>Inventory change push</th><td><code id="loc-inv-url"></code></td></tr>
+            <tr><th>Product sync (event)</th><td><code id="loc-product-url"></code></td></tr>
         </table>
         </div>
 
@@ -277,13 +285,29 @@ for pick in records:
         <pre style="background:#f0f0f0;padding:12px;border-radius:6px;">POST https://your-wp-site.com/wp-json/loc/v1/inventory-update
 Body: {"odoo_product_id": 42, "qty_available": 15.0}</pre>
 
-        <h3>⑤ Data flow overview</h3>
+        <h3>⑤ Odoo product.template change → WordPress (event sync, optional)</h3>
+        <p><strong>Settings → Technical → Automated actions</strong>: model <code>product.template</code>, trigger when the record is saved (or created and updated). Action: Execute code. Use the same <code>X-Odoo-Secret</code> as other webhooks (must match WordPress option <em>Webhook secret</em>).</p>
+        <pre style="background:#f0f0f0;padding:12px;border-radius:6px;">import requests
+WP = 'https://your-wp-site.com/wp-json/loc/v1/product-sync'
+SECRET = 'your_webhook_secret'
+for tmpl in records:
+    requests.post(
+        WP,
+        json={'odoo_template_id': tmpl.id},
+        headers={'X-Odoo-Secret': SECRET, 'Content-Type': 'application/json'},
+        timeout=60,
+    )</pre>
+        <p>Multiple ids: <code>{"template_ids": [101, 102]}</code>. Response includes <code>saved</code>, <code>skipped</code>, <code>not_found</code>. A full-catalog pull via HTTP is off by default; enable with WordPress filter <code>loc_odoo_webhook_allow_full_product_sync</code> and body <code>{"full_sync": true}</code> only if you understand the load. After a successful event sync, WooCommerce stock for <strong>all</strong> linked products may refresh (same as manual inventory sync) unless you disable <code>loc_odoo_pull_inventory_after_product_webhook</code>.</p>
+
+        <h3>⑥ Data flow overview</h3>
+        <p>Long corrupted Internal Reference values in Odoo (e.g. <code>AN5648-T425-T896-…</code>) are almost always <strong>historical</strong>: they were produced when an older integration wrote WooCommerce SKUs back into Odoo <code>default_code</code>. The current plugin does not do that; you must clean bad values in Odoo manually or by import. Scheduled product sync only <strong>reads</strong> from Odoo into WordPress.</p>
         <table class="wp-list-table widefat striped">
             <thead><tr><th>Event</th><th>Direction</th><th>Description</th></tr></thead>
             <tbody>
                 <tr><td>User registration / update address</td><td>WP → Odoo</td><td>Sync to res.partner, with membership number</td></tr>
                 <tr><td>Product save</td><td>—</td><td>No product push to Odoo (Odoo is source of truth for catalog)</td></tr>
                 <tr><td>Scheduled pull (hourly)</td><td>Odoo → WP</td><td>Sync product info & price</td></tr>
+                <tr><td>Odoo <code>product.template</code> saved (optional)</td><td>Odoo → WP</td><td>POST <code>/wp-json/loc/v1/product-sync</code> with webhook secret</td></tr>
                 <tr><td>Scheduled pull (every 15 minutes)</td><td>Odoo → WP</td><td>Sync inventory quantity</td></tr>
                 <tr><td>Customer checkout (processing)</td><td>WP → Odoo</td><td>Create sale.order and confirm</td></tr>
                 <tr><td>Order completed</td><td>WP → Odoo</td><td>Create and post invoice, validate delivery</td></tr>

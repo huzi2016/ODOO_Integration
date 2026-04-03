@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: LIMO Odoo Connector
- * Description: Integrates LIMO_Membership / WooCommerce with Odoo: default JSON-2 API (Odoo 19+), optional JSON-RPC for self-hosted 14–18. Product & inventory sync, orders, webhooks.
- * Version: 1.1.11
+ * Description: Integrates LIMO_Membership / WooCommerce with Odoo: default JSON-2 API (Odoo 19+), optional JSON-RPC for self-hosted 14–18. Read-only to Odoo by default; optional writes for orders/partners. Product catalog writes blocked unless explicitly allowed.
+ * Version: 1.2.2
  * Author: LIMO
  * Requires at least: 6.0
  * Requires PHP: 8.0
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'LOC_VERSION',     '1.1.11' );
+define( 'LOC_VERSION',     '1.2.2' );
 define( 'LOC_PLUGIN_PATH', plugin_dir_path( __FILE__ ) );
 define( 'LOC_PLUGIN_URL',  plugin_dir_url( __FILE__ ) );
 
@@ -37,6 +37,8 @@ add_action( 'plugins_loaded', static function () {
 
 // ── Activation: create log table ────────────────────────────────────────────
 register_activation_hook( __FILE__, static function () {
+    wp_clear_scheduled_hook( 'loc_sync_inventory' );
+
     global $wpdb;
     $table   = $wpdb->prefix . 'loc_sync_log';
     $charset = $wpdb->get_charset_collate();

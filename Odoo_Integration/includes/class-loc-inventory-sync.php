@@ -15,11 +15,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 class LOC_Inventory_Sync {
 
     public static function init(): void {
-        // Schedule 15-minute stock sync
+        // Register custom interval BEFORE scheduling — otherwise wp_schedule_event() rejects unknown recurrence.
+        add_filter( 'cron_schedules', [ __CLASS__, 'add_cron_interval' ] );
         if ( ! wp_next_scheduled( 'loc_sync_inventory' ) ) {
             wp_schedule_event( time(), 'loc_every_15_min', 'loc_sync_inventory' );
         }
-        add_filter( 'cron_schedules', [ __CLASS__, 'add_cron_interval' ] );
         add_action( 'loc_sync_inventory', [ __CLASS__, 'pull_inventory' ] );
 
         // REST endpoint: Odoo pushes stock changes here
@@ -84,9 +84,14 @@ class LOC_Inventory_Sync {
                 continue;
             }
 
-            $old_qty = $product->get_stock_quantity();
-            if ( (float) $old_qty === $qty ) {
-                continue; // no change
+            $old_raw = $product->get_stock_quantity();
+            $old_qty = ( $old_raw === null || $old_raw === '' ) ? 0.0 : (float) $old_raw;
+            if ( abs( $old_qty - $qty ) < 0.000001 ) {
+                continue;
+            }
+
+            if ( ! $product->get_manage_stock() ) {
+                $product->set_manage_stock( true );
             }
 
             wc_update_product_stock( $product, $qty, 'set' );
@@ -145,6 +150,7 @@ class LOC_Inventory_Sync {
             return new WP_REST_Response( [ 'error' => 'wc product load failed' ], 500 );
         }
 
+        $product->set_manage_stock( true );
         wc_update_product_stock( $product, $qty, 'set' );
         $product->set_stock_status( $qty > 0 ? 'instock' : 'outofstock' );
         $product->save();

@@ -11,6 +11,10 @@
  * Credentials: `LOC_ODOO_URL`, `LOC_ODOO_DB`, `LOC_ODOO_PASSWORD` (API key for JSON-2).
  * JSON-RPC mode also needs `LOC_ODOO_USER` + password/API key.
  *
+ * Writes: `create` / `write` / `call` are blocked when `loc_odoo_writes_allowed` is false (default).
+ * Product catalog models (`product.template`, `product.product`) are always blocked unless
+ * `loc_odoo_allow_product_catalog_write` is true — prevents accidental Internal Reference corruption.
+ *
  * @package LIMO_Odoo_Connector
  */
 
@@ -22,6 +26,42 @@ class LOC_API {
 
     /** Cached uid from JSON-2 context_get or JSON-RPC authenticate. */
     private static ?int $uid = null;
+
+    /** Log at most one api_write line per HTTP request (avoid spam). */
+    private static bool $logged_api_write_block = false;
+
+    /**
+     * Global switch for any Odoo mutation (create, write, call).
+     * Default false. Enable: `define( 'LOC_ODOO_WRITES_ALLOWED', true );` or filter `loc_odoo_writes_allowed`.
+     */
+    public static function writes_allowed(): bool {
+        if ( defined( 'LOC_ODOO_WRITES_ALLOWED' ) ) {
+            return (bool) LOC_ODOO_WRITES_ALLOWED;
+        }
+        return (bool) apply_filters( 'loc_odoo_writes_allowed', false );
+    }
+
+    /**
+     * Block writes to product master data even when `writes_allowed()` is true (e.g. order sync).
+     */
+    public static function catalog_model_write_forbidden( string $model ): bool {
+        if ( apply_filters( 'loc_odoo_allow_product_catalog_write', false ) ) {
+            return false;
+        }
+        $blocked = apply_filters(
+            'loc_odoo_blocked_catalog_models',
+            [ 'product.template', 'product.product' ]
+        );
+        return in_array( $model, $blocked, true );
+    }
+
+    private static function log_api_write_blocked_once( string $message ): void {
+        if ( self::$logged_api_write_block ) {
+            return;
+        }
+        self::$logged_api_write_block = true;
+        self::log( 'api_write', 0, 0, 'ok', $message );
+    }
 
     public static function url(): string {
         return defined( 'LOC_ODOO_URL' )
@@ -128,6 +168,14 @@ class LOC_API {
     }
 
     public static function create( string $model, array $vals ): int|false {
+        if ( ! self::writes_allowed() ) {
+            self::log_api_write_blocked_once( 'Odoo writes disabled (LOC_ODOO_WRITES_ALLOWED / loc_odoo_writes_allowed).' );
+            return false;
+        }
+        if ( self::catalog_model_write_forbidden( $model ) ) {
+            self::log_api_write_blocked_once( 'Blocked create on catalog model ' . $model . ' (loc_odoo_allow_product_catalog_write).' );
+            return false;
+        }
         if ( self::api_mode() === 'jsonrpc' ) {
             $r = self::legacy_execute( $model, 'create', [ $vals ], [] );
             return self::normalize_create_result( $r );
@@ -137,6 +185,14 @@ class LOC_API {
     }
 
     public static function write( string $model, array $ids, array $vals ): bool {
+        if ( ! self::writes_allowed() ) {
+            self::log_api_write_blocked_once( 'Odoo writes disabled (LOC_ODOO_WRITES_ALLOWED / loc_odoo_writes_allowed).' );
+            return false;
+        }
+        if ( self::catalog_model_write_forbidden( $model ) ) {
+            self::log_api_write_blocked_once( 'Blocked write on catalog model ' . $model . ' (loc_odoo_allow_product_catalog_write).' );
+            return false;
+        }
         if ( self::api_mode() === 'jsonrpc' ) {
             $r = self::legacy_execute( $model, 'write', [ $ids, $vals ], [] );
             return $r === true;
@@ -146,6 +202,14 @@ class LOC_API {
     }
 
     public static function call( string $model, string $method, array $args = [], array $kwargs = [] ): mixed {
+        if ( ! self::writes_allowed() ) {
+            self::log_api_write_blocked_once( 'Odoo writes disabled (LOC_ODOO_WRITES_ALLOWED / loc_odoo_writes_allowed).' );
+            return false;
+        }
+        if ( self::catalog_model_write_forbidden( $model ) ) {
+            self::log_api_write_blocked_once( 'Blocked call on catalog model ' . $model . '.' . $method . ' (loc_odoo_allow_product_catalog_write).' );
+            return false;
+        }
         if ( self::api_mode() === 'jsonrpc' ) {
             return self::legacy_execute( $model, $method, $args, $kwargs );
         }
@@ -201,9 +265,14 @@ class LOC_API {
             if ( ! is_array( $pids ) || $pids === [] ) {
                 continue;
             }
+            $read_fields = apply_filters(
+                'loc_odoo_variant_stock_read_fields',
+                [ 'product_tmpl_id', 'qty_available', 'free_qty' ]
+            );
+
             for ( $j = 0, $pn = count( $pids ); $j < $pn; $j += $read_chunk ) {
                 $id_chunk = array_slice( $pids, $j, $read_chunk );
-                $variants = self::read( 'product.product', $id_chunk, [ 'product_tmpl_id', 'qty_available' ] );
+                $variants = self::read( 'product.product', $id_chunk, $read_fields );
                 if ( ! is_array( $variants ) ) {
                     continue;
                 }
@@ -213,13 +282,29 @@ class LOC_API {
                     }
                     $tid = self::many2one_to_int( $v['product_tmpl_id'] ?? null );
                     if ( $tid > 0 && array_key_exists( $tid, $sums ) ) {
-                        $sums[ $tid ] += (float) ( $v['qty_available'] ?? 0 );
+                        $sums[ $tid ] += self::variant_qty_from_odoo_row( $v );
                     }
                 }
             }
         }
 
         return $sums;
+    }
+
+    /**
+     * Prefer qty_available; some Odoo / API stacks omit it and expose free_qty instead.
+     *
+     * @param array<string,mixed> $row product.product read row.
+     */
+    private static function variant_qty_from_odoo_row( array $row ): float {
+        $raw = $row['qty_available'] ?? null;
+        if ( ! is_numeric( $raw ) ) {
+            $raw = $row['free_qty'] ?? null;
+        }
+        if ( ! is_numeric( $raw ) ) {
+            return 0.0;
+        }
+        return (float) $raw;
     }
 
     /**

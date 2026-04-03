@@ -3,6 +3,7 @@
  * LOC_Product_Sync — Product data from Odoo into WooCommerce (one-way).
  *
  * Flow (Odoo → WP): scheduled pull copies Odoo product data to WooCommerce.
+ * Event trigger: POST /wp-json/loc/v1/product-sync (same X-Odoo-Secret as other webhooks).
  * WordPress does not write product.template fields back to Odoo (no push).
  *
  * Meta keys stored on WC products:
@@ -31,6 +32,9 @@ class LOC_Product_Sync {
 
         // ── Manual trigger via admin AJAX ───────────────────────────────────
         add_action( 'wp_ajax_loc_sync_products', [ __CLASS__, 'ajax_sync' ] );
+
+        // ── Odoo → WP event hook (Automated Action / external HTTP) ─────────
+        add_action( 'rest_api_init', [ __CLASS__, 'register_rest_route' ] );
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -140,6 +144,187 @@ class LOC_Product_Sync {
 
         $skip_msg = $skipped > 0 ? " {$skipped} duplicate Internal Reference(s) skipped (same SKU already mapped)." : '';
         LOC_API::log( 'product_pull', 0, 0, 'ok', "Pull finished: {$total} product(s) saved.{$skip_msg}{$suffix}" );
+
+        if ( apply_filters( 'loc_odoo_pull_inventory_after_product_pull', true ) && class_exists( 'LOC_Inventory_Sync' ) ) {
+            LOC_Inventory_Sync::pull_inventory();
+        }
+    }
+
+    /**
+     * Pull one or more product.template rows by Odoo database id (event-driven sync).
+     *
+     * @param int[] $template_ids Odoo product.template ids.
+     * @return array{ok:bool,saved:int,skipped:int,not_found:int[],errors:string[]}
+     */
+    public static function pull_templates_by_ids( array $template_ids ): array {
+        $template_ids = array_values(
+            array_unique(
+                array_filter(
+                    array_map( 'intval', $template_ids ),
+                    static fn( int $i ): bool => $i > 0
+                )
+            )
+        );
+
+        if ( $template_ids === [] ) {
+            return [
+                'ok'        => false,
+                'saved'     => 0,
+                'skipped'   => 0,
+                'not_found' => [],
+                'errors'    => [ 'no valid template ids' ],
+            ];
+        }
+
+        $records = LOC_API::read( 'product.template', $template_ids, self::ODOO_FIELDS );
+        if ( ! is_array( $records ) ) {
+            LOC_API::log( 'product_webhook', 0, 0, 'error', 'product.template read failed for ids: ' . implode( ',', $template_ids ) );
+            return [
+                'ok'        => false,
+                'saved'     => 0,
+                'skipped'   => 0,
+                'not_found' => $template_ids,
+                'errors'    => [ 'read() failed' ],
+            ];
+        }
+
+        if ( $records === [] ) {
+            LOC_API::log( 'product_webhook', 0, 0, 'error', 'No product.template rows for ids: ' . implode( ',', $template_ids ) );
+            return [
+                'ok'        => false,
+                'saved'     => 0,
+                'skipped'   => 0,
+                'not_found' => $template_ids,
+                'errors'    => [ 'no matching rows' ],
+            ];
+        }
+
+        $found_ids = [];
+        foreach ( $records as $rec ) {
+            if ( is_array( $rec ) && isset( $rec['id'] ) ) {
+                $found_ids[] = (int) $rec['id'];
+            }
+        }
+        $found_ids   = array_values( array_unique( $found_ids ) );
+        $not_found   = array_values( array_diff( $template_ids, $found_ids ) );
+        $qty_by_tmpl = LOC_API::sum_qty_available_by_template_ids( $found_ids );
+
+        $saved   = 0;
+        $skipped = 0;
+        foreach ( $records as $rec ) {
+            if ( ! is_array( $rec ) || ! isset( $rec['id'] ) ) {
+                continue;
+            }
+            $tid                    = (int) $rec['id'];
+            $rec['qty_available']   = $qty_by_tmpl[ $tid ] ?? 0.0;
+            $out                    = self::upsert_wc_product( $rec );
+            if ( $out === 'skipped' ) {
+                ++$skipped;
+            } elseif ( $out === 'saved' ) {
+                ++$saved;
+            }
+        }
+
+        if ( apply_filters( 'loc_odoo_pull_inventory_after_product_webhook', true ) && class_exists( 'LOC_Inventory_Sync' ) ) {
+            LOC_Inventory_Sync::pull_inventory();
+        }
+
+        $processed = $saved + $skipped;
+        $ok        = $processed > 0;
+
+        LOC_API::log(
+            'product_webhook',
+            0,
+            0,
+            $ok ? 'ok' : 'error',
+            'Event product sync ids=' . implode( ',', $template_ids ) . " saved={$saved} skipped={$skipped} not_found=" . count( $not_found )
+        );
+
+        return [
+            'ok'        => $ok,
+            'saved'     => $saved,
+            'skipped'   => $skipped,
+            'not_found' => $not_found,
+            'errors'    => [],
+        ];
+    }
+
+    /**
+     * REST: Odoo calls this when a product.template is created or written.
+     */
+    public static function register_rest_route(): void {
+        register_rest_route(
+            'loc/v1',
+            '/product-sync',
+            [
+                'methods'             => 'POST',
+                'callback'            => [ __CLASS__, 'handle_product_webhook' ],
+                'permission_callback' => [ 'LOC_Order_Sync', 'verify_webhook_secret' ],
+            ]
+        );
+    }
+
+    /**
+     * JSON body options:
+     * - odoo_template_id: int — single template
+     * - template_ids: int[] — several templates
+     * - full_sync: true — run pull_all() (off unless filter loc_odoo_webhook_allow_full_product_sync returns true)
+     */
+    public static function handle_product_webhook( WP_REST_Request $request ): WP_REST_Response {
+        if ( function_exists( 'set_time_limit' ) ) {
+            @set_time_limit( 120 );
+        }
+
+        $body = $request->get_json_params();
+        if ( ! is_array( $body ) ) {
+            $body = [];
+        }
+
+        if ( ! empty( $body['full_sync'] ) && apply_filters( 'loc_odoo_webhook_allow_full_product_sync', false ) ) {
+            self::pull_all();
+            return new WP_REST_Response(
+                [
+                    'ok'   => true,
+                    'mode' => 'full_sync',
+                ],
+                200
+            );
+        }
+
+        $ids = [];
+        if ( isset( $body['odoo_template_id'] ) ) {
+            $ids[] = (int) $body['odoo_template_id'];
+        }
+        if ( ! empty( $body['template_ids'] ) && is_array( $body['template_ids'] ) ) {
+            foreach ( $body['template_ids'] as $x ) {
+                $ids[] = (int) $x;
+            }
+        }
+
+        $ids = array_values(
+            array_unique(
+                array_filter(
+                    array_map( 'intval', $ids ),
+                    static fn( int $i ): bool => $i > 0
+                )
+            )
+        );
+
+        if ( $ids === [] ) {
+            return new WP_REST_Response(
+                [ 'error' => 'missing odoo_template_id or template_ids (or full_sync not allowed)' ],
+                400
+            );
+        }
+
+        $result = self::pull_templates_by_ids( $ids );
+        $code   = $result['ok'] ? 200 : 404;
+        $err0   = $result['errors'][0] ?? '';
+        if ( ! $result['ok'] && $err0 === 'read() failed' ) {
+            $code = 500;
+        }
+
+        return new WP_REST_Response( $result, $code );
     }
 
     /**
