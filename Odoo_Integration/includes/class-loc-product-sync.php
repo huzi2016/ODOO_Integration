@@ -317,9 +317,40 @@ class LOC_Product_Sync {
             );
         }
 
-        $result = self::pull_templates_by_ids( $ids );
-        $code   = $result['ok'] ? 200 : 404;
-        $err0   = $result['errors'][0] ?? '';
+        $debounce_sec = (int) apply_filters( 'loc_odoo_product_webhook_debounce_seconds', 5 );
+        $to_pull       = [];
+        $debounced_ids = [];
+        foreach ( $ids as $tid ) {
+            $tkey = 'loc_odoo_psync_' . $tid;
+            if ( $debounce_sec > 0 && get_transient( $tkey ) ) {
+                $debounced_ids[] = $tid;
+                continue;
+            }
+            if ( $debounce_sec > 0 ) {
+                set_transient( $tkey, 1, $debounce_sec );
+            }
+            $to_pull[] = $tid;
+        }
+
+        if ( $to_pull === [] ) {
+            return new WP_REST_Response(
+                [
+                    'ok'                     => true,
+                    'debounced'              => true,
+                    'debounced_template_ids' => $debounced_ids,
+                    'message'                => 'All requested templates were synced within the debounce window; skipped duplicate webhook.',
+                ],
+                200
+            );
+        }
+
+        $result = self::pull_templates_by_ids( $to_pull );
+        if ( $debounced_ids !== [] ) {
+            $result['debounced_template_ids'] = $debounced_ids;
+        }
+
+        $code = $result['ok'] ? 200 : 404;
+        $err0 = $result['errors'][0] ?? '';
         if ( ! $result['ok'] && $err0 === 'read() failed' ) {
             $code = 500;
         }

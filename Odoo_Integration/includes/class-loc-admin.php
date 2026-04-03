@@ -297,7 +297,9 @@ for tmpl in records:
         headers={'X-Odoo-Secret': SECRET, 'Content-Type': 'application/json'},
         timeout=60,
     )</pre>
-        <p>Multiple ids: <code>{"template_ids": [101, 102]}</code>. Response includes <code>saved</code>, <code>skipped</code>, <code>not_found</code>. A full-catalog pull via HTTP is off by default; enable with WordPress filter <code>loc_odoo_webhook_allow_full_product_sync</code> and body <code>{"full_sync": true}</code> only if you understand the load. After a successful event sync, WooCommerce stock for <strong>all</strong> linked products may refresh (same as manual inventory sync) unless you disable <code>loc_odoo_pull_inventory_after_product_webhook</code>.</p>
+        <p>Multiple ids: <code>{"template_ids": [101, 102]}</code>. Response includes <code>saved</code>, <code>skipped</code>, <code>not_found</code>. Duplicate webhook calls for the same template id within 5 seconds are ignored (filter <code>loc_odoo_product_webhook_debounce_seconds</code>). A full-catalog pull via HTTP is off by default; enable with WordPress filter <code>loc_odoo_webhook_allow_full_product_sync</code> and body <code>{"full_sync": true}</code> only if you understand the load. After a successful event sync, WooCommerce stock for <strong>all</strong> linked products may refresh (same as manual inventory sync) unless you disable <code>loc_odoo_pull_inventory_after_product_webhook</code>.</p>
+
+        <p><strong>Redundant rows appearing in Odoo (thousands of similar products):</strong> This WordPress plugin does <strong>not</strong> create or duplicate <code>product.template</code> in Odoo — it only <code>read</code>s. If new duplicate cards appear <em>in Odoo</em> after you edit a product, the cause is not the WooCommerce pull: check <strong>Settings → Technical → Automated actions</strong> and <strong>Server actions</strong> on <code>product.template</code> for Python that calls <code>create</code>, <code>copy</code>, or import. The webhook snippet above must only use <code>requests.post</code> to WordPress. Long snowballing Internal Reference strings (e.g. <code>AN5648-T613-T985-…</code>) are usually legacy data or past two-way sync; clean duplicates in Odoo (merge/archive) and keep a single canonical Internal Reference per item.</p>
 
         <h3>⑥ Data flow overview</h3>
         <p>Long corrupted Internal Reference values in Odoo (e.g. <code>AN5648-T425-T896-…</code>) are almost always <strong>historical</strong>: they were produced when an older integration wrote WooCommerce SKUs back into Odoo <code>default_code</code>. The current plugin does not do that; you must clean bad values in Odoo manually or by import. Scheduled product sync only <strong>reads</strong> from Odoo into WordPress.</p>
@@ -329,10 +331,7 @@ for tmpl in records:
             wp_send_json_error( 'Permission denied.' );
         }
 
-        // Reset cached uid
-        $ref = new ReflectionProperty( 'LOC_API', 'uid' );
-        $ref->setAccessible( true );
-        $ref->setValue( null, null );
+        LOC_API::reset_auth();
 
         $uid = LOC_API::authenticate();
         if ( $uid ) {

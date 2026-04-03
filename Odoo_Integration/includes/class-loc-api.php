@@ -63,6 +63,14 @@ class LOC_API {
         self::log( 'api_write', 0, 0, 'ok', $message );
     }
 
+    /**
+     * Clear cached JSON-RPC uid and per-request API write log flag (e.g. before “Test connection”).
+     */
+    public static function reset_auth(): void {
+        self::$uid                     = null;
+        self::$logged_api_write_block = false;
+    }
+
     public static function url(): string {
         return defined( 'LOC_ODOO_URL' )
             ? rtrim( LOC_ODOO_URL, '/' )
