@@ -45,13 +45,10 @@ class LOC_Order_Sync {
     // ════════════════════════════════════════════════════════════════════════
 
     public static function on_order_created( WC_Order $order ): void {
-        $sale_id = self::create_sale_order( $order );
-        // If the order is already processing when created (e.g. instant payment),
-        // confirm immediately — on_processing will be a no-op due to the transient lock.
-        if ( $sale_id > 0 && $order->has_status( 'processing' ) ) {
-            LOC_API::call( 'sale.order', 'action_confirm', [ [ $sale_id ] ] );
-            LOC_API::log( 'order_confirm', $order->get_id(), $sale_id, 'ok', 'Sale order confirmed (from on_order_created)' );
-        }
+        // Create sale.order in Odoo as draft — confirmation happens in on_processing
+        // once payment is received.  If the order immediately enters processing status
+        // (e.g. free order, auto-capture gateway), on_processing fires right after.
+        self::create_sale_order( $order );
     }
 
     public static function on_processing( int $order_id ): void {
@@ -60,14 +57,22 @@ class LOC_Order_Sync {
         if ( $sale_id <= 0 ) {
             $sale_id = self::create_sale_order( $order );
         }
-        if ( $sale_id > 0 ) {
-            // Guard: only confirm once — sale.order may already be in 'sale' state.
-            $states = LOC_API::read( 'sale.order', [ $sale_id ], [ 'state' ] );
-            $state  = is_array( $states ) && ! empty( $states ) ? ( $states[0]['state'] ?? '' ) : '';
-            if ( $state !== 'sale' && $state !== 'done' ) {
-                LOC_API::call( 'sale.order', 'action_confirm', [ [ $sale_id ] ] );
-                LOC_API::log( 'order_confirm', $order_id, $sale_id, 'ok', 'Sale order confirmed' );
-            }
+        if ( $sale_id <= 0 ) {
+            return;
+        }
+
+        // Guard: only confirm once — sale.order may already be in 'sale' state.
+        $rows  = LOC_API::read( 'sale.order', [ $sale_id ], [ 'state' ] );
+        $state = is_array( $rows ) && ! empty( $rows ) ? ( $rows[0]['state'] ?? '' ) : '';
+        if ( $state !== 'sale' && $state !== 'done' ) {
+            LOC_API::call( 'sale.order', 'action_confirm', [ [ $sale_id ] ] );
+            LOC_API::log( 'order_confirm', $order_id, $sale_id, 'ok', 'Sale order confirmed' );
+        }
+
+        // After confirmation Odoo auto-creates a stock.picking (出货单).
+        // Fetch it and write the picking name/id back to the WC order.
+        if ( ! $order->get_meta( '_loc_odoo_delivery_id' ) ) {
+            self::fetch_and_store_delivery( $order, $sale_id );
         }
     }
 
@@ -124,13 +129,17 @@ class LOC_Order_Sync {
         }
         set_transient( $lock_key, 1, 30 );
 
-        // ── Resolve Odoo partner ──────────────────────────────────────────────
+        // ── Resolve Odoo partner (billing contact) ───────────────────────────
         $customer_id     = (int) $order->get_customer_id();
         $odoo_partner_id = 0;
         if ( $customer_id > 0 ) {
             $odoo_partner_id = (int) get_user_meta( $customer_id, '_loc_odoo_partner_id', true );
             if ( $odoo_partner_id <= 0 ) {
                 $odoo_partner_id = LOC_Customer_Sync::upsert_partner( $customer_id );
+            }
+            // Always push the freshest billing data from the order itself to Odoo.
+            if ( $odoo_partner_id > 0 ) {
+                LOC_API::write( 'res.partner', [ $odoo_partner_id ], self::billing_partner_vals( $order ) );
             }
         } else {
             $odoo_partner_id = self::create_guest_partner( $order );
@@ -206,16 +215,21 @@ class LOC_Order_Sync {
             }
         }
 
+        // ── Build sale.order values ───────────────────────────────────────────
+        $customer_note = trim( $order->get_customer_note() );
+        $internal_note = "WooCommerce order #{$order_id}"
+            . ( $customer_note ? "\n\nCustomer note: {$customer_note}" : '' );
+
         $sale_vals = [
-            'partner_id'         => $odoo_partner_id,
-            'client_order_ref'   => 'WC#' . $order_id,
-            'note'               => "WooCommerce order #{$order_id}",
-            'order_line'         => $order_lines,
-            'date_order'         => $order->get_date_created()?->format( 'Y-m-d H:i:s' ) ?? gmdate( 'Y-m-d H:i:s' ),
+            'partner_id'       => $odoo_partner_id,
+            'client_order_ref' => 'WC#' . $order_id,
+            'note'             => $internal_note,   // internal note shown on the SO
+            'order_line'       => $order_lines,
+            'date_order'       => $order->get_date_created()?->format( 'Y-m-d H:i:s' ) ?? gmdate( 'Y-m-d H:i:s' ),
         ];
 
-        // Add shipping address if different
-        $shipping_partner_id = self::maybe_create_shipping_partner( $order, $odoo_partner_id );
+        // Shipping address: required for Odoo to set the correct delivery address on the picking.
+        $shipping_partner_id = self::upsert_shipping_partner( $order, $odoo_partner_id );
         if ( $shipping_partner_id > 0 ) {
             $sale_vals['partner_shipping_id'] = $shipping_partner_id;
         }
@@ -412,60 +426,199 @@ class LOC_Order_Sync {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Helpers
+    // Delivery (出货单) helpers
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * Create a minimal Odoo partner for guest checkout.
+     * After a sale.order is confirmed, Odoo auto-creates a stock.picking (出货单).
+     * Fetch that picking, store its id + name on the WC order, and add an order note.
+     * Called from on_processing() once per order.
      */
-    private static function create_guest_partner( WC_Order $order ): int {
-        $name  = trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() );
-        $email = $order->get_billing_email();
+    private static function fetch_and_store_delivery( WC_Order $order, int $sale_id ): void {
+        $order_id = $order->get_id();
 
-        // Check if already exists
-        $found = LOC_API::search( 'res.partner', [ [ 'email', '=', $email ] ], [ 'limit' => 1 ] );
-        if ( is_array( $found ) && ! empty( $found ) ) {
-            return (int) $found[0];
+        $pickings = LOC_API::search_read(
+            'stock.picking',
+            [
+                [ 'sale_id', '=', $sale_id ],
+                [ 'picking_type_code', '=', 'outgoing' ],
+                [ 'state', 'not in', [ 'cancel' ] ],
+            ],
+            [ 'id', 'name', 'state', 'scheduled_date' ],
+            [ 'limit' => 5, 'order' => 'id asc' ]
+        );
+
+        if ( ! is_array( $pickings ) || empty( $pickings ) ) {
+            LOC_API::log( 'delivery', $order_id, $sale_id, 'error', 'No outgoing picking found after SO confirmation — check Odoo warehouse rules.' );
+            return;
         }
 
-        return (int) LOC_API::create( 'res.partner', [
-            'name'          => sanitize_text_field( $name ?: $email ),
-            'email'         => sanitize_email( $email ),
-            'phone'         => sanitize_text_field( $order->get_billing_phone() ),
-            'customer_rank' => 1,
-            'comment'       => 'Guest checkout — WC#' . $order->get_id(),
-        ] );
+        $picking    = $pickings[0];
+        $picking_id = (int) $picking['id'];
+        $pick_name  = $picking['name'] ?? "ID:{$picking_id}";
+        $pick_state = $picking['state'] ?? '';
+
+        $order->update_meta_data( '_loc_odoo_delivery_id', $picking_id );
+        $order->save_meta_data();
+        $order->add_order_note(
+            sprintf(
+                '出货单 (Odoo Delivery): %s [state: %s] — 待 Odoo 仓库确认发货后会自动回调更新物流信息。',
+                $pick_name,
+                $pick_state
+            )
+        );
+        LOC_API::log( 'delivery', $order_id, $picking_id, 'ok', "Delivery order linked: {$pick_name}" );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Partner helpers
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Map the billing fields from a WC order to Odoo res.partner vals.
+     * Used to keep the partner up-to-date when a registered customer places an order.
+     *
+     * @return array<string,mixed>
+     */
+    private static function billing_partner_vals( WC_Order $order ): array {
+        $vals = [
+            'name'   => sanitize_text_field(
+                trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() )
+                ?: $order->get_billing_email()
+            ),
+            'email'  => sanitize_email( $order->get_billing_email() ),
+            'phone'  => sanitize_text_field( $order->get_billing_phone() ),
+            'street' => sanitize_text_field( $order->get_billing_address_1() ),
+            'city'   => sanitize_text_field( $order->get_billing_city() ),
+            'zip'    => sanitize_text_field( $order->get_billing_postcode() ),
+        ];
+        if ( $order->get_billing_address_2() ) {
+            $vals['street2'] = sanitize_text_field( $order->get_billing_address_2() );
+        }
+        $country_id = self::resolve_country_id( $order->get_billing_country() );
+        if ( $country_id ) {
+            $vals['country_id'] = $country_id;
+            $state_id = self::resolve_state_id( $order->get_billing_state(), $country_id );
+            if ( $state_id ) {
+                $vals['state_id'] = $state_id;
+            }
+        }
+        return $vals;
     }
 
     /**
-     * Create a child shipping partner in Odoo if the shipping address differs.
+     * Create a full res.partner for a guest order (no WP account).
      */
-    private static function maybe_create_shipping_partner( WC_Order $order, int $parent_id ): int {
-        $ship_name = trim(
-            $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name()
-        );
-        if ( ! $ship_name || $order->get_shipping_address_1() === $order->get_billing_address_1() ) {
+    private static function create_guest_partner( WC_Order $order ): int {
+        $email = $order->get_billing_email();
+        if ( ! $email ) {
             return 0;
         }
 
+        // Reuse existing partner by email to avoid duplicates.
+        $found = LOC_API::search( 'res.partner', [ [ 'email', '=', $email ] ], [ 'limit' => 1 ] );
+        if ( is_array( $found ) && ! empty( $found ) ) {
+            $id = (int) $found[0];
+            LOC_API::write( 'res.partner', [ $id ], self::billing_partner_vals( $order ) );
+            return $id;
+        }
+
+        $vals                  = self::billing_partner_vals( $order );
+        $vals['customer_rank'] = 1;
+        $vals['comment']       = 'Guest checkout — WC#' . $order->get_id();
+
+        return (int) LOC_API::create( 'res.partner', $vals );
+    }
+
+    /**
+     * Create or update the delivery (type=delivery) child partner in Odoo for the shipping address.
+     * Returns 0 if shipping address is identical to billing (no child partner needed).
+     * Always updates an existing delivery partner with the latest address data.
+     */
+    private static function upsert_shipping_partner( WC_Order $order, int $parent_id ): int {
+        $ship_street = $order->get_shipping_address_1();
+        $bill_street = $order->get_billing_address_1();
+
+        // If shipping address is blank or same as billing, let Odoo use the main partner.
+        if ( ! $ship_street || $ship_street === $bill_street ) {
+            return 0;
+        }
+
+        $ship_vals = [
+            'parent_id' => $parent_id,
+            'type'      => 'delivery',
+            'name'      => sanitize_text_field(
+                trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() )
+                ?: trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() )
+            ),
+            'phone'   => sanitize_text_field( $order->get_billing_phone() ),
+            'street'  => sanitize_text_field( $ship_street ),
+            'city'    => sanitize_text_field( $order->get_shipping_city() ),
+            'zip'     => sanitize_text_field( $order->get_shipping_postcode() ),
+        ];
+        if ( $order->get_shipping_address_2() ) {
+            $ship_vals['street2'] = sanitize_text_field( $order->get_shipping_address_2() );
+        }
+        $country_id = self::resolve_country_id( $order->get_shipping_country() ?: $order->get_billing_country() );
+        if ( $country_id ) {
+            $ship_vals['country_id'] = $country_id;
+            $state_id = self::resolve_state_id(
+                $order->get_shipping_state() ?: $order->get_billing_state(),
+                $country_id
+            );
+            if ( $state_id ) {
+                $ship_vals['state_id'] = $state_id;
+            }
+        }
+
+        // Look for existing delivery child partner and update it.
         $existing = LOC_API::search(
             'res.partner',
             [ [ 'parent_id', '=', $parent_id ], [ 'type', '=', 'delivery' ] ],
             [ 'limit' => 1 ]
         );
         if ( is_array( $existing ) && ! empty( $existing ) ) {
-            return (int) $existing[0];
+            $pid = (int) $existing[0];
+            LOC_API::write( 'res.partner', [ $pid ], $ship_vals );
+            return $pid;
         }
 
-        return (int) LOC_API::create( 'res.partner', [
-            'name'      => sanitize_text_field( $ship_name ),
-            'parent_id' => $parent_id,
-            'type'      => 'delivery',
-            'street'    => sanitize_text_field( $order->get_shipping_address_1() ),
-            'street2'   => sanitize_text_field( $order->get_shipping_address_2() ),
-            'city'      => sanitize_text_field( $order->get_shipping_city() ),
-            'zip'       => sanitize_text_field( $order->get_shipping_postcode() ),
-        ] );
+        return (int) LOC_API::create( 'res.partner', $ship_vals );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Geo helpers (country / state id lookup with per-request cache)
+    // ════════════════════════════════════════════════════════════════════════
+
+    private static function resolve_country_id( string $iso_code ): int {
+        static $cache = [];
+        $iso_code = strtoupper( trim( $iso_code ) );
+        if ( ! $iso_code ) {
+            return 0;
+        }
+        if ( ! isset( $cache[ $iso_code ] ) ) {
+            $ids = LOC_API::search( 'res.country', [ [ 'code', '=', $iso_code ] ], [ 'limit' => 1 ] );
+            $cache[ $iso_code ] = ( is_array( $ids ) && ! empty( $ids ) ) ? (int) $ids[0] : 0;
+        }
+        return $cache[ $iso_code ];
+    }
+
+    private static function resolve_state_id( string $state_code, int $country_id ): int {
+        static $cache = [];
+        $state_code = strtoupper( trim( $state_code ) );
+        if ( ! $state_code || ! $country_id ) {
+            return 0;
+        }
+        $key = "{$country_id}:{$state_code}";
+        if ( ! isset( $cache[ $key ] ) ) {
+            $ids = LOC_API::search(
+                'res.country.state',
+                [ [ 'code', '=', $state_code ], [ 'country_id', '=', $country_id ] ],
+                [ 'limit' => 1 ]
+            );
+            $cache[ $key ] = ( is_array( $ids ) && ! empty( $ids ) ) ? (int) $ids[0] : 0;
+        }
+        return $cache[ $key ];
     }
 
     /**
